@@ -11,6 +11,7 @@ const PHOTO_MAX_SIDE = 800;          // 写真の長辺(px)
 const PHOTO_QUALITY = 0.8;           // JPEG 品質
 const PHOTO_MAX_BYTES = 400 * 1024;  // 1枚の上限
 const PHOTOS_PER_PART = 20;          // 1品番に登録できる写真の上限
+const POINTS_PER_PHOTO = 20;         // 1枚のマスター写真に登録できる検査ポイントの上限
 const WRITE_TIMEOUT = 20000;         // 書き込みの待ち時間(ms)
 
 const cloud = {
@@ -135,6 +136,7 @@ const cloud = {
         createdAt: p.createdAt || 0, updatedAt: p.updatedAt || 0
       };
       if (typeof p.threshold === 'number') rec.threshold = p.threshold;
+      if (p.points && typeof p.points === 'object') rec.points = p.points;     // 検査ポイント { 写真ID: [ポイント…] }
       const old = localParts.find(lp => lp.partNo === p.partNo);
       if (!old || JSON.stringify(old) !== JSON.stringify(rec)) { await dbPut('cparts', rec); changed = true; }
       if (p.pending) continue;      // 書き込み確定前の写真は、確定してから取りに行く
@@ -238,9 +240,26 @@ const cloud = {
     this._needAdmin();
     const F = window.FB, b = F.writeBatch(this.db);
     b.delete(F.doc(this.db, 'photos', id));
-    b.update(F.doc(this.db, 'parts', partNo), { photoIds: F.arrayRemove(id), updatedAt: Date.now(), updatedBy: this._by() });
+    const upd = { photoIds: F.arrayRemove(id), updatedAt: Date.now(), updatedBy: this._by() };
+    upd['points.' + id] = F.deleteField();            // その写真の検査ポイントも一緒に消す
+    b.update(F.doc(this.db, 'parts', partNo), upd);
     await this._timeout(b.commit());
     await dbDel('cmasters', id); this.onData();
+  },
+  /** 1枚のマスター写真の検査ポイントを保存する。list が空なら削除。
+   *  list: [{ name, x, y, w, h, must, th? }]（x,y,w,h は 0〜1 の比率） */
+  async setPoints(partNo, photoId, list) {
+    this._needAdmin();
+    if (list.length > POINTS_PER_PHOTO) throw new Error(`検査ポイントは1枚の写真に${POINTS_PER_PHOTO}個までです`);
+    const F = window.FB, upd = { updatedAt: Date.now(), updatedBy: this._by() };
+    upd['points.' + photoId] = list.length ? list : F.deleteField();
+    await this._timeout(F.updateDoc(F.doc(this.db, 'parts', partNo), upd));
+    const cur = await dbGet('cparts', partNo);          // この端末のキャッシュにもすぐ反映
+    if (cur) {
+      cur.points = Object.assign({}, cur.points);
+      if (list.length) cur.points[photoId] = list; else delete cur.points[photoId];
+      await dbPut('cparts', cur); this.onData();
+    }
   }
 };
 
