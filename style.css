@@ -139,3 +139,14 @@ h2 { margin: 0; font-size: 24px; }
 @media (orientation: portrait) {
   .square { max-height: none; }
 }
+
+/* 横向きタブレット：写真は左、結果とボタンは右に並べて、スクロール無しで使えるようにする */
+@media (orientation: landscape) and (min-width: 900px) {
+  #view-verify.active { display: grid; grid-template-columns: 1fr 360px; grid-template-rows: auto 1fr auto; column-gap: 16px; }
+  #view-verify .part-btn { grid-column: 1 / -1; }
+  #view-verify .panes { grid-column: 1; grid-row: 2 / span 2; margin-top: 12px; }
+  #view-verify .square { max-height: none; width: min(100%, calc(100vh - 330px)); }
+  #view-verify .result { grid-column: 2; grid-row: 2; display: flex; flex-direction: column; justify-content: center; margin-top: 12px; }
+  #view-verify .action-row { grid-column: 2; grid-row: 3; align-self: end; }
+  #view-verify .result-main { font-size: min(30vh, 170px); }
+}
