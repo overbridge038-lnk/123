@@ -29,7 +29,7 @@
     <div class="panes">
       <div class="pane">
         <div class="pane-title">マスター（正しい品物）</div>
-        <div class="square"><img id="masterImg" alt="マスター写真"><div id="masterEmpty" class="empty">品番を選んでください</div></div>
+        <div class="square"><img id="masterImg" alt="マスター写真"><svg id="masterOverlay" class="overlay" viewBox="0 0 1 1" preserveAspectRatio="none" hidden></svg><div id="masterEmpty" class="empty">品番を選んでください</div></div>
         <div id="masterThumbs" class="thumbs"></div>
       </div>
       <div class="pane">
@@ -37,6 +37,7 @@
         <div class="square" id="camBox">
           <video id="video" playsinline muted autoplay></video>
           <img id="shotImg" alt="撮影した現品" hidden>
+          <svg id="shotOverlay" class="overlay" viewBox="0 0 1 1" preserveAspectRatio="none" hidden></svg>
           <div id="camMsg" class="empty" hidden></div>
         </div>
         <div class="thumbs"><span class="hint">四角の中央が照合の範囲です</span></div>
@@ -46,6 +47,7 @@
     <div id="result" class="result idle">
       <div id="resultMain" class="result-main">待機中</div>
       <div id="resultSub" class="result-sub">品番を選んで「撮影して照合」を押してください</div>
+      <div id="pointList" class="point-list" hidden></div>
     </div>
 
     <div class="action-row">
@@ -146,6 +148,17 @@
       <p class="hint">品番ごとにしきい値を決めていない場合に使われます。</p>
     </div>
     <div class="card-block">
+      <label class="field-label">検査ポイントの標準しきい値（形の一致度 %）</label>
+      <div class="stepper">
+        <button id="pthMinus" class="btn step" type="button">−</button>
+        <div id="pthValue" class="step-val">70%</div>
+        <button id="pthPlus" class="btn step" type="button">＋</button>
+      </div>
+      <p class="hint">検査ポイントごとにしきい値を決めていない場合に使われます。</p>
+      <label class="check"><input id="optCombine" type="checkbox"><span>全体の類似度も合格条件に加える（併用）</span></label>
+      <p class="hint">オンにすると「全ポイントOK」かつ「全体の類似度がしきい値以上」のときだけ総合OKになります。</p>
+    </div>
+    <div class="card-block">
       <label class="field-label" for="operator">作業者名（履歴に記録されます）</label>
       <input id="operator" class="input" type="text" placeholder="例：山田">
     </div>
@@ -204,6 +217,7 @@
 <script src="vendor/firebase.js"></script>
 <script src="firebase-config.js"></script>
 <script src="cloud.js"></script>
+<script src="shape.js"></script>
 <script src="app.js"></script>
 </body>
 </html>
