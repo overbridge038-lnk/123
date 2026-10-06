@@ -1,7 +1,7 @@
 'use strict';
 /* Service Worker：全ファイルを端末にキャッシュして、オフラインでも動かす。
  * アプリのファイルを更新したら、下の CACHE の番号（v1 → v2 …）を必ず上げてください。 */
-const CACHE = 'gohin-v4';
+const CACHE = 'gohin-v5';
 const FILES = [
   './', './index.html', './style.css', './app.js', './manifest.json',
   './vendor/tf.min.js', './vendor/firebase.js', './firebase-config.js', './cloud.js', './shape.js',
