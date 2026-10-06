@@ -14,6 +14,7 @@
 <body>
 
 <div id="modelBar" class="model-bar">AIモデルを読み込み中…（初回のみ少し時間がかかります）</div>
+<div id="syncBar" class="sync-bar" hidden></div>
 
 <main id="views">
 
@@ -128,6 +129,14 @@
   <section id="view-settings" class="view">
     <div class="bar"><h2>設定</h2></div>
     <div class="card-block">
+      <label class="field-label">ログイン中のアカウント</label>
+      <div id="accountInfo" class="hint">確認中…</div>
+      <div class="row wrap">
+        <button id="resyncBtn" class="btn" type="button">いま同期する</button>
+        <button id="logoutBtn" class="btn" type="button">ログアウト</button>
+      </div>
+    </div>
+    <div class="card-block">
       <label class="field-label">標準のしきい値（類似度 %）</label>
       <div class="stepper">
         <button id="dthMinus" class="btn step" type="button">−</button>
@@ -150,9 +159,14 @@
       <label class="field-label">アプリ情報</label>
       <div id="appInfo" class="hint"></div>
     </div>
+    <div class="card-block" id="migrateBlock" hidden>
+      <label class="field-label">旧データの移行（管理者のみ）</label>
+      <p class="hint">クラウド対応前に、この端末だけに登録していた品番・マスター写真があります。クラウドへ移すと全員で共有できます。</p>
+      <button id="migrateBtn" class="btn primary" type="button">クラウドへ移行する</button>
+    </div>
     <div class="card-block">
-      <button id="wipeBtn" class="btn danger" type="button">すべてのデータを削除</button>
-      <p class="hint">登録した品番・マスター写真・履歴をすべて消します。元に戻せません。</p>
+      <button id="wipeBtn" class="btn danger" type="button">この端末のデータを削除</button>
+      <p class="hint">この端末にある履歴とマスターのコピーを消します。クラウドのマスターは消えません（ネットに繋がると取得し直します）。履歴は元に戻せません。</p>
     </div>
   </section>
 
@@ -165,10 +179,31 @@
   <button type="button" data-view="settings"><span class="ico">⚙</span>設定</button>
 </nav>
 
+<!-- ============ ログイン ============ -->
+<div id="login" class="login" hidden>
+  <form id="loginForm" class="login-box" autocomplete="on">
+    <h1>誤品照合</h1>
+    <div id="loginNotice" class="login-notice" hidden></div>
+    <div id="loginFields">
+      <label class="field-label" for="loginEmail">メールアドレス</label>
+      <input id="loginEmail" class="input" type="email" name="email" autocomplete="username" inputmode="email" autocapitalize="off" required>
+      <label class="field-label" for="loginPass" style="margin-top:14px">パスワード</label>
+      <input id="loginPass" class="input" type="password" name="password" autocomplete="current-password" required>
+      <div id="loginError" class="login-error" hidden></div>
+      <button id="loginBtn" class="btn big primary" type="submit" style="margin-top:18px;width:100%">ログイン</button>
+    </div>
+    <button id="loginOut" class="btn" type="button" style="margin-top:14px;width:100%" hidden>ログアウト</button>
+    <p class="hint">アカウントは管理者が作成します。わからないときは管理者に聞いてください。</p>
+  </form>
+</div>
+
 <div id="modal" class="modal" hidden></div>
 <div id="toast" class="toast" hidden></div>
 
 <script src="vendor/tf.min.js"></script>
+<script src="vendor/firebase.js"></script>
+<script src="firebase-config.js"></script>
+<script src="cloud.js"></script>
 <script src="app.js"></script>
 </body>
 </html>

@@ -1,0 +1,59 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ログイン済みで、かつ members に登録されたメールアドレスだけが「メンバー」
+    function signedIn() {
+      return request.auth != null && request.auth.token.email != null;
+    }
+    function isMember() {
+      return signedIn()
+        && exists(/databases/$(database)/documents/members/$(request.auth.token.email));
+    }
+    function isAdmin() {
+      return isMember()
+        && get(/databases/$(database)/documents/members/$(request.auth.token.email)).data.role == 'admin';
+    }
+
+    // メンバー名簿（ドキュメントID＝メールアドレス（小文字）、role は 'admin' か 'member'）
+    // アプリからは「自分の分を1件読む」ことだけ可能。書き込みは Firebase コンソールからのみ。
+    match /members/{email} {
+      allow get: if signedIn() && request.auth.token.email == email;
+      allow list, write: if false;
+    }
+
+    // 品番
+    match /parts/{partNo} {
+      allow read: if isMember();
+      allow create: if isAdmin()
+        && request.resource.data.keys().hasOnly(['name', 'threshold', 'photoIds', 'createdAt', 'updatedAt', 'updatedBy'])
+        && request.resource.data.name is string && request.resource.data.name.size() <= 100
+        && request.resource.data.photoIds is list && request.resource.data.photoIds.size() == 0;
+      allow update: if isAdmin()
+        && request.resource.data.keys().hasOnly(['name', 'threshold', 'photoIds', 'createdAt', 'updatedAt', 'updatedBy'])
+        && request.resource.data.name is string && request.resource.data.name.size() <= 100
+        && request.resource.data.photoIds is list && request.resource.data.photoIds.size() <= 30
+        && (!('threshold' in request.resource.data)
+            || (request.resource.data.threshold is number
+                && request.resource.data.threshold >= 1 && request.resource.data.threshold <= 99));
+      allow delete: if isAdmin();
+    }
+
+    // マスター写真（1枚＝1ドキュメント。JPEG は 400KB 以下）
+    match /photos/{photoId} {
+      allow read: if isMember();
+      allow create: if isAdmin()
+        && request.resource.data.keys().hasOnly(['partNo', 'jpeg', 'w', 'h', 'createdAt', 'createdBy'])
+        && request.resource.data.partNo is string && request.resource.data.partNo.size() <= 100
+        && request.resource.data.jpeg is bytes
+        && request.resource.data.jpeg.size() <= 409600;
+      allow update: if false;
+      allow delete: if isAdmin();
+    }
+
+    // 上記以外はすべて拒否
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}
