@@ -6,7 +6,7 @@
  */
 
 /* ================= 設定値 ================= */
-const APP_VERSION = '2.1.0';
+const APP_VERSION = '2.2.0';
 const MODEL_URL = 'model/model.json';
 const FEATURE_NODE = 'module_apply_default/MobilenetV2/Conv_1/Relu6'; // 7x7x1280 の特徴マップ
 const MODEL_VER = 'mnv2-1';       // モデルや計算方法を変えたら必ず変更（登録済み写真の特徴量を再計算するため）
@@ -20,6 +20,7 @@ const PAGE = 50;                  // 履歴の1ページ件数
 const DEFAULT_POINT_TH = 70;      // 検査ポイントの標準しきい値(%)。実際の品物で必ず調整してください
 const ALIGN_MIN = 0.3;            // 位置合わせの良さ(0〜1)がこれ未満なら「位置合わせ失敗」
 const POINT_COVER_MIN = 0.6;      // ポイントの四角のうち、現品の写真に入っている割合の下限
+const UNK = '判定不能';            // 判定の結果：OK / NG / 判定不能（計算できなかった・条件が不適切。OK は絶対に出さない）
 const MAX_ALIGN = 8;              // 位置合わせを試すマスター写真の最大数（時間がかかりすぎないように）
 
 const $ = (s, r = document) => r.querySelector(s);
@@ -239,8 +240,13 @@ function beep(freq, dur, when = 0) {
     o.start(audioCtx.currentTime + when); o.stop(audioCtx.currentTime + when + dur);
   } catch (e) { /* 音が出せなくても続行 */ }
 }
-function notifyResult(ok) {
-  if (settings.sound) { if (ok) beep(1200, 0.18); else { beep(300, 0.45); beep(300, 0.45, 0.6); } }
+function notifyResult(result) {         // result: 'OK' | 'NG' | 判定不能（OK 以外は警告音）
+  const ok = result === 'OK';
+  if (settings.sound) {
+    if (ok) beep(1200, 0.18);
+    else if (result === 'NG') { beep(300, 0.45); beep(300, 0.45, 0.6); }
+    else { beep(600, 0.2); beep(450, 0.2, 0.3); beep(600, 0.2, 0.6); }
+  }
   if (settings.vibrate && navigator.vibrate) navigator.vibrate(ok ? 120 : [400, 150, 400]);
 }
 let wakeLock = null;
@@ -258,6 +264,56 @@ function friendlyError(e) {
   if (c === 'permission-denied') return '権限がありません。管理者アカウントでログインしているか確認してください';
   if (c === 'unavailable') return '通信できません。電波を確認してください';
   return (e && e.message) || '失敗しました';
+}
+
+/** エラーの詳細（種類・メッセージ・どの段階か）を文章にする。報告用にコピーできる */
+function describeError(e, context) {
+  const o = e && typeof e === 'object' ? e : { message: String(e) };
+  const lines = [];
+  if (context) lines.push('場面: ' + context);
+  if (o.phase) lines.push('失敗した段階: ' + o.phase);
+  lines.push('種類: ' + (o.code || o.name || '不明'));
+  lines.push('メッセージ: ' + (o.message || '（なし）'));
+  if (o.customData) { try { lines.push('詳細: ' + JSON.stringify(o.customData)); } catch (x) { /* 無視 */ } }
+  if (o.stack) lines.push('場所: ' + String(o.stack).split('\n').slice(0, 4).join(' | '));
+  return lines.join('\n');
+}
+function environmentInfo() {
+  return [
+    '日時: ' + new Date().toLocaleString('ja-JP'),
+    'アプリ: ' + APP_VERSION,
+    'ログイン: ' + ((cloud.user && cloud.user.email) || '—') + '（' + (cloud.role || '権限不明') + '）',
+    '通信: ' + (navigator.onLine ? 'オンライン' : 'オフライン'),
+    '端末: ' + navigator.userAgent
+  ].join('\n');
+}
+async function copyText(text) {
+  try { await navigator.clipboard.writeText(text); return true; } catch (e) { /* 次の方法へ */ }
+  try {
+    const t = document.createElement('textarea');
+    t.value = text; t.style.position = 'fixed'; t.style.opacity = '0';
+    document.body.appendChild(t); t.select();
+    const ok = document.execCommand('copy'); t.remove(); return ok;
+  } catch (e) { return false; }
+}
+/** box の中に、エラーの内容と「エラー内容をコピー」ボタンを作る（貼り付けてそのまま報告できる） */
+function fillErrorBox(box, title, summary, detail) {
+  const text = [title, summary, '', detail, '', environmentInfo()].join('\n');
+  box.innerHTML = `<p class="errsum">${esc(summary)}</p><textarea class="errbox" readonly></textarea><button type="button" class="btn errcopy">エラー内容をコピー</button>`;
+  const ta = $('.errbox', box); ta.value = text;
+  $('.errcopy', box).onclick = async () => {
+    const ok = await copyText(text);
+    if (!ok) ta.select();
+    toast(ok ? 'コピーしました。そのまま貼り付けて報告してください' : 'コピーできませんでした。文字を長押しして選んでコピーしてください', 4000);
+  };
+  box.hidden = false;
+}
+function showErrorReport(title, summary, detail) {
+  return openDialog((d, close) => {
+    d.innerHTML = `<h3>${esc(title)}</h3><div class="errwrap"></div><div class="row"><button class="btn primary" id="errClose">閉じる</button></div>`;
+    fillErrorBox($('.errwrap', d), title, summary, detail);
+    $('#errClose', d).onclick = () => close();
+  });
 }
 
 /* ================= 品番の補助 ================= */
@@ -311,8 +367,10 @@ async function masterShape(m) {
 
 /** 写真(canvas)を圧縮してクラウドに登録する（管理者のみ） */
 async function addMasterFromCanvas(partNo, canvas) {
-  const { blob, w, h } = await compressForCloud(canvas);
-  await cloud.addPhoto(partNo, blob, w, h);
+  let c;
+  try { c = await compressForCloud(canvas); }
+  catch (e) { if (e && typeof e === 'object') e.phase = '写真の圧縮'; throw e; }
+  return cloud.addPhoto(partNo, c.blob, c.w, c.h);
 }
 async function pickPart(currentNo) {
   const parts = (await dbAll('cparts')).sort((a, b) => a.partNo.localeCompare(b.partNo, 'ja', { numeric: true }));
@@ -349,6 +407,11 @@ async function showView(name) {
   if (name === 'master') master.enter();
   if (name === 'history') histView.enter();
   if (name === 'settings') settingsView.enter();
+}
+
+/** 「判定不能」にするための例外（理由を画面に出す） */
+class Unjudgeable extends Error {
+  constructor(reason, extra) { super(reason); this.reason = reason; Object.assign(this, extra || {}); }
 }
 
 /* ================= 照合画面 ================= */
@@ -405,7 +468,7 @@ const verify = {
     this.part = await dbGet('cparts', no);
     await kvSet('lastPart', no);
     await this.loadMasters();
-    this.state = 'live'; this.overlay = null; this.showPointList(null);
+    this.state = 'live'; this.overlay = null; this.showPointList(null); this.showResultError(null);
     this.showLive();
     this.setResult('idle', '待機中', '現品を四角の中に入れて「撮影して照合」を押してください');
     this.render();
@@ -467,7 +530,7 @@ const verify = {
 
   async onShoot() {
     if (this.state === 'result') {           // 次の照合へ
-      this.state = 'live'; this.bestId = null; this.overlay = null; this.showPointList(null); this.showLive();
+      this.state = 'live'; this.bestId = null; this.overlay = null; this.showPointList(null); this.showResultError(null); this.showLive();
       this.setResult('idle', '待機中', '現品を四角の中に入れて「撮影して照合」を押してください');
       this.render(); if (!this.cam.active) this.startCamera();
       return;
@@ -479,43 +542,80 @@ const verify = {
     await this.judge(canvas);
   },
 
+  /** 判定の入口。OK は「必要な計算がすべて正常に終わり、必須条件をすべて満たした」ときだけ。
+   *  途中で例外・計算失敗・位置合わせ失敗があれば、必ず「判定不能」にする（エラーなのに OK は出さない） */
   async judge(canvas) {
     if (!this.part || !this.masters.length) { toast('マスター写真がありません'); return; }
-    this.state = 'busy'; this.overlay = null; this.render();
+    this.state = 'busy'; this.overlay = null; this.showResultError(null); this.render();
     this.showShot(canvas);
     this.setResult('busy', '判定中…', 'AIが写真を比べています');
+    let out;
     try {
       const ptMasters = this.masters.filter(m => pointsOf(this.part, m.id).length);
-      if (ptMasters.length) await this.judgePoints(canvas, ptMasters);
-      else await this.judgeGlobal(canvas);
+      out = ptMasters.length ? await this.judgePoints(canvas, ptMasters) : await this.judgeGlobal(canvas);
+      if (!out || (out.result !== 'OK' && out.result !== 'NG' && out.result !== UNK)) throw new Error('判定結果が不正です');
     } catch (e) {
       console.error(e);
-      this.setResult('ng', 'エラー', (e && e.message) || '判定に失敗しました');
+      out = e instanceof Unjudgeable
+        ? { result: UNK, reason: e.reason, masterId: e.masterId, mode: e.mode, items: e.items }
+        : { result: UNK, reason: '判定中にエラーが発生しました：' + ((e && e.message) || e) + '。撮り直してください', error: e };
+    }
+    try { await this.finish(canvas, out); }
+    catch (e) {                                   // 表示や履歴の保存で失敗しても、OK のままにはしない
+      console.error(e);
+      this.setResult('unk', UNK, '結果を表示できませんでした。撮り直してください');
       this.showPointList(null);
     }
     this.state = 'result'; this.render();
   },
 
-  /** 従来の方式：写真全体の見た目の類似度 */
+  /** 判定結果（out）を画面・履歴・音に反映する */
+  async finish(canvas, out) {
+    const kind = out.result === 'OK' ? 'ok' : out.result === 'NG' ? 'ng' : 'unk';
+    const mid = out.masterId || (this.masters[0] && this.masters[0].id);
+    if (out.masterId) { this.bestId = out.masterId; this.shown = Math.max(0, this.masters.findIndex(m => m.id === out.masterId)); }
+    this.overlay = out.items && out.masterId ? { masterId: out.masterId, items: out.items } : null;
+    let sub = out.result === UNK ? '撮り直してください：' + out.reason : out.sub;
+    let saveFailed = null;
+    try {
+      await this.saveHistory(canvas, {
+        result: out.result, score: out.score || 0, threshold: out.threshold || 0, masterId: mid, mode: out.mode || 'global',
+        reason: out.reason || '', points: out.points, global: out.global, note: out.note
+      });
+    } catch (e) { console.error(e); saveFailed = e; sub += '（履歴に保存できませんでした）'; }
+    this.setResult(kind, out.result, sub);
+    this.showPointList(out.items || null);
+    this.showResultError(out.error ? out.error : saveFailed, out.error ? '判定' : '履歴の保存');
+    notifyResult(out.result);
+  },
+
+  showResultError(e, context) {
+    const box = $('#resultErr');
+    if (!e) { box.hidden = true; box.innerHTML = ''; return; }
+    fillErrorBox(box, '判定でエラーが発生しました', `${this.part ? '品番: ' + this.part.partNo : ''}`, describeError(e, context));
+  },
+
+  /** 従来の方式：写真全体の見た目の類似度（検査ポイントを設定していない品番だけ） */
   async judgeGlobal(canvas) {
     const { score, best } = await this.globalScore(canvas);
-    const threshold = thresholdOf(this.part), ok = score >= threshold;
-    const score1 = Math.round(score * 10) / 10;
-    this.bestId = best.id;
-    this.shown = this.masters.findIndex(m => m.id === best.id);
-    this.setResult(ok ? 'ok' : 'ng', ok ? 'OK' : 'NG', `類似度 ${score1.toFixed(1)}%（しきい値 ${threshold}%）`);
-    this.showPointList(null);
-    notifyResult(ok);
-    await this.saveHistory(canvas, { score: score1, threshold, result: ok ? 'OK' : 'NG', masterId: best.id });
+    const threshold = thresholdOf(this.part);
+    if (!Number.isFinite(score) || !best) throw new Unjudgeable('類似度を計算できませんでした', { masterId: best && best.id });
+    const ok = score >= threshold, score1 = Math.round(score * 10) / 10;
+    return {
+      result: ok ? 'OK' : 'NG', score: score1, threshold, masterId: best.id, mode: 'global',
+      sub: `類似度 ${score1.toFixed(1)}%（しきい値 ${threshold}%）`
+    };
   },
 
   /** 全マスターとの全体の類似度（いちばん高いもの） */
   async globalScore(canvas) {
     const emb = await embed(canvas);
+    if (!emb.g.every(Number.isFinite) || !emb.s.every(Number.isFinite)) throw new Unjudgeable('現品の写真から特徴を取り出せませんでした');
     let best = null, score = -1;
     for (const m of this.masters) {
-      await ensureEmbedding(m);
+      try { await ensureEmbedding(m); } catch (e) { throw new Unjudgeable('マスター写真のデータが破損しています（' + ((e && e.message) || e) + '）', { masterId: m.id }); }
       const s = similarity(emb, m.emb);
+      if (!Number.isFinite(s)) throw new Unjudgeable('マスター写真のデータが不足・破損しています', { masterId: m.id });
       if (s > score) { score = s; best = m; }
     }
     return { score, best };
@@ -529,53 +629,60 @@ const verify = {
     for (let i = 0; i < cands.length; i++) {
       this.setResult('busy', '判定中…', cands.length > 1 ? `位置合わせ ${i + 1}/${cands.length}` : '位置合わせ中');
       await sleep(30);                                     // 画面の更新を先に済ませる
-      const mp = await masterShape(cands[i]);
-      const al = Shape.align(mp, shot);
-      if (!best || al.score > best.al.score) best = { m: cands[i], mp, al };
+      let mp, al;
+      try { mp = await masterShape(cands[i]); al = Shape.align(mp, shot); }
+      catch (e) { throw new Unjudgeable('マスター写真のデータが不足・破損しています（' + ((e && e.message) || e) + '）', { masterId: cands[i].id, mode: 'points' }); }
+      const sc = Number.isFinite(al.score) ? al.score : -1;
+      if (!best || sc > best.sc) best = { m: cands[i], mp, al, sc };
     }
-    this.bestId = best.m.id;
-    this.shown = this.masters.findIndex(m => m.id === best.m.id);
-    if (best.al.score < ALIGN_MIN || best.al.cover < Shape.MIN_COVER) {
-      this.setResult('ng', 'NG', '位置合わせできませんでした。現品を四角の中央に置いて撮り直してください');
-      this.showPointList(null);
-      notifyResult(false);
-      await this.saveHistory(canvas, { score: 0, threshold: settings.pointThreshold, result: 'NG', masterId: best.m.id, mode: 'points', note: '位置合わせ失敗' });
-      return;
+    const fail = (reason, items) => new Unjudgeable(reason, { masterId: best.m.id, mode: 'points', items });
+    if (!(best.al.score >= ALIGN_MIN) || !(best.al.cover >= Shape.MIN_COVER)) {
+      throw fail('位置合わせできませんでした。現品を四角の中央に置いて撮り直してください');
     }
     await sleep(0);
     const pts = pointsOf(this.part, best.m.id);
-    const res = Shape.checkPoints(best.mp, shot, best.al.P, pts);
+    let res;
+    try { res = Shape.checkPoints(best.mp, shot, best.al.P, pts); }
+    catch (e) { throw fail('照合の計算に失敗しました（' + ((e && e.message) || e) + '）'); }
+    if (!Array.isArray(res) || res.length !== pts.length) throw fail('照合の計算結果が不足しています');
     const items = pts.map((p, i) => {
-      const score = Math.round(res[i].score * 10) / 10, th = pointTh(p), out = res[i].cover < POINT_COVER_MIN;
+      const score = Math.round(res[i].score * 10) / 10, th = pointTh(p);
+      const out = !(res[i].cover >= POINT_COVER_MIN), calc = !out && Number.isFinite(score);
       const corners = [[p.x, p.y], [p.x + p.w, p.y], [p.x + p.w, p.y + p.h], [p.x, p.y + p.h]];
       return {
-        name: p.name, score, th, must: p.must !== false, out, ok: !out && score >= th,
+        name: p.name, score: Number.isFinite(score) ? score : 0, th, must: p.must !== false, out, calc, ok: calc && score >= th,
         rect: p, quad: corners.map(([x, y]) => Shape.mapPoint(best.al.P, x, y))
       };
     });
-    const must = items.filter(i => i.must), mustNg = must.filter(i => !i.ok), refNg = items.filter(i => !i.must && !i.ok);
-    let ok = mustNg.length === 0, sub;
+    const must = items.filter(i => i.must);
+    if (!must.length) throw fail('必須の検査ポイントがありません（すべて「参考」になっています）。登録タブで「必須」にしてください', items);
+    const mustNg = must.filter(i => i.calc && !i.ok), mustUnk = must.filter(i => !i.calc);
+    const refNg = items.filter(i => !i.must && !i.ok);
+    // 必須のどれか1つでも NG → NG（計算できたものだけで十分に言える）。計算できない必須があり NG が無い → 判定不能
+    if (!mustNg.length && mustUnk.length) {
+      throw fail('計算できないポイントがあります：' + mustUnk.map(i => i.name + (i.out ? '（写真の範囲外）' : '')).join('、') + '。撮り直してください', items);
+    }
+    let ok = mustNg.length === 0;
     const okN = items.filter(i => i.ok).length;
-    sub = `ポイント ${okN}/${items.length} OK`;
+    let sub = `ポイント ${okN}/${items.length} OK`;
     if (!ok) sub += '　NG：' + mustNg.map(i => i.name).join('、');
     else if (refNg.length) sub += `（参考NG：${refNg.map(i => i.name).join('、')}）`;
     let global = null;
     if (settings.combineGlobal) {                          // 併用：全体の類似度も条件に加える
-      const g = await this.globalScore(canvas), th = thresholdOf(this.part);
+      let g;
+      try { g = await this.globalScore(canvas); }
+      catch (e) { if (e instanceof Unjudgeable) { e.masterId = best.m.id; e.mode = 'points'; e.items = items; } throw e; }
+      const th = thresholdOf(this.part);
       global = { score: Math.round(g.score * 10) / 10, threshold: th };
       const gok = g.score >= th;
       sub += `　全体 ${global.score.toFixed(1)}%（基準 ${th}%）` + (gok ? '' : ' NG');
       ok = ok && gok;
     }
-    this.overlay = { masterId: best.m.id, items };
-    this.setResult(ok ? 'ok' : 'ng', ok ? 'OK' : 'NG', sub);
-    this.showPointList(items);
-    notifyResult(ok);
-    const low = Math.min(...items.map(i => i.score));
-    await this.saveHistory(canvas, {
-      score: low, threshold: settings.pointThreshold, result: ok ? 'OK' : 'NG', masterId: best.m.id, mode: 'points',
-      points: items.map(i => ({ name: i.name, score: i.score, th: i.th, ok: i.ok, must: i.must })), global
-    });
+    return {
+      result: ok ? 'OK' : 'NG', score: Math.min(...items.map(i => i.score)), threshold: settings.pointThreshold, masterId: best.m.id, mode: 'points',
+      sub, items, global,
+      points: items.map(i => ({ name: i.name, score: i.score, th: i.th, ok: i.ok, must: i.must, out: i.out }))
+    };
   },
 
   async saveHistory(canvas, rec) {
@@ -641,7 +748,11 @@ const master = {
   },
   /** クラウドへの書き込みをまとめて実行し、失敗したら理由を表示する */
   async run(fn) {
-    try { await fn(); } catch (e) { console.error(e); toast(friendlyError(e), 5000); }
+    try { await fn(); }
+    catch (e) {
+      console.error(e); toast(friendlyError(e), 5000);
+      await showErrorReport('保存できませんでした', friendlyError(e), describeError(e, '登録画面の操作'));
+    }
   },
   async enter() { if (this.editing) await this.openEdit(this.editing.partNo); else await this.renderList(); },
 
@@ -856,14 +967,30 @@ const master = {
     this.renderMasters();
   },
 
+  /** 複数の写真を1枚ずつ登録する。失敗した写真があっても残りは続け、最後にどれが失敗したか表示する */
   async addByFiles(files) {
     if (!files.length) return;
-    toast('登録中…', 60000);
-    try {
-      for (const f of files) await addMasterFromCanvas(this.editing.partNo, await canvasFromFile(f, PHOTO_MAX_SIDE));
-      toast(files.length + '枚 登録しました');
-    } catch (e) { toast('登録に失敗しました：' + friendlyError(e), 5000); }
+    const partNo = this.editing.partNo;
+    const have = ((await dbGet('cparts', partNo)) || {}).photoIds || [];
+    const room = Math.max(0, PHOTOS_PER_PART - have.length);
+    const skipped = files.slice(room);
+    files = files.slice(0, room);
+    if (!files.length) { toast(`1つの品番に登録できる写真は${PHOTOS_PER_PART}枚までです`, 4000); return; }
+    let ok = 0; const failed = [];
+    for (let i = 0; i < files.length; i++) {
+      toast(`登録中… ${i + 1}/${files.length}枚目`, 60000);
+      try { await addMasterFromCanvas(partNo, await canvasFromFile(files[i], PHOTO_MAX_SIDE)); ok++; this.renderMasters(); }
+      catch (e) {
+        console.error(e);
+        failed.push({ no: i + 1, name: files[i].name || '', e });
+      }
+    }
     this.renderMasters();
+    if (!failed.length && !skipped.length) { toast(ok + '枚 登録しました'); return; }
+    toast(`${ok}枚 登録、${failed.length}枚 失敗` + (skipped.length ? `、${skipped.length}枚 上限のため未登録` : ''), 5000);
+    const detail = failed.map(f => `【${f.no}枚目 ${f.name}】\n${describeError(f.e, 'マスター写真の登録')}`).join('\n\n') +
+      (skipped.length ? `\n\n上限（${PHOTOS_PER_PART}枚）のため登録しなかった写真: ${skipped.length}枚` : '');
+    await showErrorReport('登録できなかった写真があります', `成功 ${ok}枚／失敗 ${failed.length}枚（失敗: ${failed.map(f => f.no + '枚目').join('、') || 'なし'}）。品番: ${partNo}`, detail);
   },
 
   async addByCamera() {
@@ -873,6 +1000,7 @@ const master = {
       d.innerHTML = `<h3>マスター写真を撮影（${esc(partNo)}）</h3>
         <div class="square"><video playsinline muted autoplay></video><img hidden alt=""><div class="empty" hidden></div></div>
         <div class="hint" id="camHelp">四角の中央が登録される範囲です。現品を真ん中に置いてください。</div>
+        <div class="errwrap" id="camErr" hidden></div>
         <div class="row"><button class="btn" id="cClose">閉じる</button><button class="btn primary" id="cShoot">撮影</button></div>`;
       const cam = new Camera($('video', d)), img = $('img', d), msg = $('.empty', d), shoot = $('#cShoot', d);
       let mode = 'live', shot = null;
@@ -887,9 +1015,12 @@ const master = {
           $('#cClose', d).textContent = '撮り直す';
           $('#cClose', d).onclick = () => { URL.revokeObjectURL(img.src); img.hidden = true; $('video', d).hidden = false; mode = 'live'; shoot.textContent = '撮影'; $('#cClose', d).textContent = '閉じる'; $('#cClose', d).onclick = finish; };
         } else {
-          shoot.disabled = true; shoot.textContent = '登録中…';
+          shoot.disabled = true; shoot.textContent = '登録中…'; $('#camErr', d).hidden = true;
           try { await addMasterFromCanvas(partNo, shot); added++; toast('登録しました（' + added + '枚）'); this.renderMasters(); }
-          catch (e) { toast('登録に失敗：' + friendlyError(e), 5000); }
+          catch (e) {
+            console.error(e); toast('登録に失敗しました', 3000);
+            fillErrorBox($('#camErr', d), '写真を登録できませんでした', `品番: ${partNo}`, describeError(e, 'マスター写真の登録（カメラ）'));
+          }
           URL.revokeObjectURL(img.src); img.hidden = true; $('video', d).hidden = false;
           mode = 'live'; shoot.disabled = false; shoot.textContent = '続けて撮影'; $('#cClose', d).textContent = '終了';
           $('#cClose', d).onclick = finish;
@@ -924,8 +1055,8 @@ const histView = {
     const q = $('#histSearch').value.trim().toLowerCase();
     this.filtered = this.rows.filter(r => (!this.resultFilter || r.result === this.resultFilter) && (!q || r.partNo.toLowerCase().includes(q)));
     this.shown = 0; $('#histList').innerHTML = ''; clearUrls('hist');
-    const ng = this.filtered.filter(r => r.result === 'NG').length;
-    $('#histSummary').textContent = `${this.filtered.length}件（OK ${this.filtered.length - ng} / NG ${ng}）`;
+    const cnt = k => this.filtered.filter(r => r.result === k).length;
+    $('#histSummary').textContent = `${this.filtered.length}件（OK ${cnt('OK')} / NG ${cnt('NG')} / ${UNK} ${cnt(UNK)}）`;
     this.draw(false);
   },
   draw() {
@@ -933,7 +1064,7 @@ const histView = {
     this.filtered.slice(this.shown, this.shown + PAGE).forEach(r => {
       const b = document.createElement('button'); b.className = 'hrow';
       b.innerHTML = (r.photo ? `<img src="${mkUrl('hist', r.photo)}" alt="">` : '<div style="width:64px;height:64px"></div>') +
-        `<div class="mid"><div class="p">${esc(r.partNo)}</div><div class="d">${fmtDate(r.ts)}　${histScore(r)}${r.operator ? '　' + esc(r.operator) : ''}</div></div><div class="badge ${r.result}">${r.result}</div>`;
+        `<div class="mid"><div class="p">${esc(r.partNo)}</div><div class="d">${fmtDate(r.ts)}　${histScore(r)}${r.operator ? '　' + esc(r.operator) : ''}</div></div><div class="badge ${badgeClass(r.result)}">${r.result}</div>`;
       b.onclick = () => this.detail(r);
       list.appendChild(b);
     });
@@ -944,10 +1075,10 @@ const histView = {
   detail(r) {
     clearUrls('histd');
     openDialog((d, close) => {
-      d.innerHTML = `<h3>${esc(r.partNo)}　<span class="badge ${r.result}">${r.result}</span></h3>` +
+      d.innerHTML = `<h3>${esc(r.partNo)}　<span class="badge ${badgeClass(r.result)}">${r.result}</span></h3>` +
         (r.photo ? `<img class="photo" src="${mkUrl('histd', r.photo)}" alt="">` : '') +
         `<p>${fmtDate(r.ts)}<br>${histScore(r)}${r.operator ? '<br>作業者：' + esc(r.operator) : ''}</p>` +
-        (r.mode === 'points' && r.points ? '<p>' + r.points.map((p, i) => `${p.ok ? '✅' : '❌'} ${i + 1}.${esc(p.name)} ${p.score.toFixed(0)}%（基準 ${p.th}%）${p.must ? '' : '（参考）'}`).join('<br>') + '</p>' : '') +
+        (r.mode === 'points' && r.points ? '<p>' + r.points.map((p, i) => `${p.ok ? '✅' : '❌'} ${i + 1}.${esc(p.name)} ${p.out ? '範囲外' : p.score.toFixed(0) + '%'}（基準 ${p.th}%）${p.must ? '' : '（参考）'}`).join('<br>') + '</p>' : '') +
         `<div class="row"><button class="btn danger" id="hDel">この履歴を削除</button><button class="btn primary" id="hClose">閉じる</button></div>`;
       $('#hClose', d).onclick = () => close();
       $('#hDel', d).onclick = async () => { await dbDel('history', r.id); close(); this.enter(); };
@@ -956,8 +1087,16 @@ const histView = {
   exportCsv() {
     if (!this.filtered.length) { toast('書き出す履歴がありません'); return; }
     const q = s => '"' + String(s).replace(/"/g, '""') + '"';
-    const lines = [['日時', '品番', '品名', '結果', '類似度(%)', 'しきい値(%)', '作業者', '方式', 'NGポイント'].map(q).join(',')];
-    [...this.filtered].reverse().forEach(r => lines.push([fmtDate(r.ts), r.partNo, r.partName || '', r.result, r.mode === 'points' ? '' : r.score.toFixed(1), r.mode === 'points' ? '' : r.threshold, r.operator || '', r.mode === 'points' ? '検査ポイント' : '全体の類似度', (r.points || []).filter(p => !p.ok).map(p => p.name).concat(r.note ? [r.note] : []).join(' / ')].map(q).join(',')));
+    const head = ['日時', '品番', '品名', '結果', '類似度(%)', 'しきい値(%)', '作業者', '方式', 'NGポイント', '判定不能の理由', '各ポイントの測定値'];
+    const lines = [head.map(q).join(',')];
+    [...this.filtered].reverse().forEach(r => {
+      const pts = r.mode === 'points';
+      const ngNames = (r.points || []).filter(p => !p.ok && !p.out).map(p => p.name).concat(r.note && r.result !== UNK ? [r.note] : []);
+      const measured = (r.points || []).map(p => `${p.name}:${p.out ? '範囲外' : p.score.toFixed(1) + '%'}(基準${p.th}%${p.must ? '' : ',参考'})`).join(' / ');
+      lines.push([fmtDate(r.ts), r.partNo, r.partName || '', r.result,
+        pts || r.result === UNK ? '' : r.score.toFixed(1), pts || r.result === UNK ? '' : r.threshold, r.operator || '',
+        pts ? '検査ポイント' : '全体の類似度', ngNames.join(' / '), r.result === UNK ? (r.reason || r.note || '') : '', measured].map(q).join(','));
+    });
     const blob = new Blob(['﻿' + lines.join('\r\n') + '\r\n'], { type: 'text/csv;charset=utf-8' });
     const a = document.createElement('a');
     const n = new Date(), p = x => String(x).padStart(2, '0');
@@ -968,7 +1107,9 @@ const histView = {
   }
 };
 /** 履歴1件の点数の説明（検査ポイント方式かどうかで変わる） */
+function badgeClass(result) { return result === UNK ? 'UNK' : result; }
 function histScore(r) {
+  if (r.result === UNK) return esc(r.reason || r.note || '判定できませんでした');
   if (r.mode !== 'points') return `類似度 ${r.score.toFixed(1)}%（基準 ${r.threshold}%）`;
   if (r.note) return esc(r.note);
   const n = (r.points || []).length, ok = (r.points || []).filter(p => p.ok).length;

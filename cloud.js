@@ -10,9 +10,10 @@
 const PHOTO_MAX_SIDE = 800;          // 写真の長辺(px)
 const PHOTO_QUALITY = 0.8;           // JPEG 品質
 const PHOTO_MAX_BYTES = 400 * 1024;  // 1枚の上限
-const PHOTOS_PER_PART = 20;          // 1品番に登録できる写真の上限
+const PHOTOS_PER_PART = 10;          // 1品番に登録できる写真の上限（セキュリティルールは30枚まで許可）
 const POINTS_PER_PHOTO = 20;         // 1枚のマスター写真に登録できる検査ポイントの上限
 const WRITE_TIMEOUT = 20000;         // 書き込みの待ち時間(ms)
+const PHOTO_WRITE_TIMEOUT = 90000;   // 写真の書き込みは大きいので長めに待つ(ms)
 
 const cloud = {
   configured: false,
@@ -23,7 +24,7 @@ const cloud = {
   onStatus: () => {},               // 同期の状態が変わった
   onData: () => {},                 // 端末内のマスター（キャッシュ）が変わった
   onUser: () => {},                 // ログイン状態・権限が変わった
-  _unsub: null, _queue: Promise.resolve(), _lastParts: null, _retryTimer: null,
+  _unsub: null, _queue: Promise.resolve(), _photoQueue: Promise.resolve(), _lastParts: null, _retryTimer: null,
 
   isAdmin() { return this.role === 'admin'; },
 
@@ -188,8 +189,10 @@ const cloud = {
     if (!this.isAdmin()) throw new Error('管理者だけが操作できます');
     if (!navigator.onLine) throw new Error('オフラインのため変更できません。ネットに繋いでから操作してください');
   },
-  _timeout(p) {
-    return Promise.race([p, new Promise((_, rej) => setTimeout(() => rej(new Error('通信できませんでした。電波を確認して、もう一度お試しください')), WRITE_TIMEOUT))]);
+  _timeout(p, ms = WRITE_TIMEOUT) {
+    let t;
+    const limit = new Promise((_, rej) => { t = setTimeout(() => { const e = new Error('通信できませんでした。電波を確認して、もう一度お試しください'); e.code = 'app/timeout'; rej(e); }, ms); });
+    return Promise.race([p, limit]).finally(() => clearTimeout(t));
   },
   _by() { return (this.user && this.user.email) || ''; },
 
@@ -218,23 +221,39 @@ const cloud = {
     await this._timeout(b.commit());
     await this._dropLocalPart(partNo); this.onData();
   },
-  /** blob: すでに縮小・圧縮済みの JPEG */
-  async addPhoto(partNo, blob, w, h) {
-    this._needAdmin();
-    if (blob.size > PHOTO_MAX_BYTES) throw new Error('写真が大きすぎます');
-    const F = window.FB, pref = F.doc(this.db, 'parts', partNo);
-    const ps = await this._timeout(F.getDoc(pref));
-    if (!ps.exists()) throw new Error('品番が見つかりません');
-    if ((ps.data().photoIds || []).length >= PHOTOS_PER_PART) throw new Error(`1つの品番に登録できる写真は${PHOTOS_PER_PART}枚までです`);
-    const ref = F.doc(F.collection(this.db, 'photos')), now = Date.now();
-    const bytes = new Uint8Array(await blob.arrayBuffer());
-    const b = F.writeBatch(this.db);
-    b.set(ref, { partNo, jpeg: F.Bytes.fromUint8Array(bytes), w, h, createdAt: now, createdBy: this._by() });
-    b.update(pref, { photoIds: F.arrayUnion(ref.id), updatedAt: now, updatedBy: this._by() });
-    await this._timeout(b.commit());
-    await dbPut('cmasters', { id: ref.id, partNo, blob, createdAt: now });
-    this.onData();
-    return ref.id;
+  /** blob: すでに縮小・圧縮済みの JPEG
+   *  失敗したときは、どの段階で失敗したか（e.phase）を付けて投げる。写真は1枚ずつ順番に保存する */
+  addPhoto(partNo, blob, w, h) {
+    const run = this._photoQueue.then(() => this._addPhoto(partNo, blob, w, h));
+    this._photoQueue = run.catch(() => {});
+    return run;
+  },
+  async _addPhoto(partNo, blob, w, h) {
+    let phase = '準備';
+    try {
+      this._needAdmin();
+      if (blob.size > PHOTO_MAX_BYTES) throw new Error('写真が大きすぎます（' + Math.round(blob.size / 1024) + 'KB）');
+      const F = window.FB, pref = F.doc(this.db, 'parts', partNo);
+      phase = '品番の確認';
+      const ps = await this._timeout(F.getDoc(pref));
+      if (!ps.exists()) throw new Error('品番が見つかりません');
+      if ((ps.data().photoIds || []).length >= PHOTOS_PER_PART) throw new Error(`1つの品番に登録できる写真は${PHOTOS_PER_PART}枚までです`);
+      phase = '写真データの読み込み';
+      const ref = F.doc(F.collection(this.db, 'photos')), now = Date.now();
+      const bytes = new Uint8Array(await blob.arrayBuffer());
+      phase = 'クラウドへの保存';
+      const b = F.writeBatch(this.db);
+      b.set(ref, { partNo, jpeg: F.Bytes.fromUint8Array(bytes), w, h, createdAt: now, createdBy: this._by() });
+      b.update(pref, { photoIds: F.arrayUnion(ref.id), updatedAt: now, updatedBy: this._by() });
+      await this._timeout(b.commit(), PHOTO_WRITE_TIMEOUT);
+      phase = '端末内への保存';
+      try { await dbPut('cmasters', { id: ref.id, partNo, blob, createdAt: now }); this.onData(); }
+      catch (e) { console.warn('端末内への保存に失敗（クラウドには保存済み。同期で取得し直します）', e); this._wake(); }
+      return ref.id;
+    } catch (e) {
+      if (e && typeof e === 'object' && !e.phase) e.phase = phase;
+      throw e;
+    }
   },
   async deletePhoto(partNo, id) {
     this._needAdmin();
