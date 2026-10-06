@@ -1,0 +1,81 @@
+rules_version = '2';
+
+// 誤品照合アプリ Firestore セキュリティルール
+//
+//  - 読み取り：config/access に登録された「管理者」「照合ユーザー」だけ
+//  - 書き込み：config/access に登録された「管理者」だけ（マスター写真・品番・共通のしきい値）
+//  - config/access 自体は、アプリからは書き換えできません（Firebase コンソールからだけ編集）
+//
+// config/access ドキュメントの中身（Firebase コンソールで作ります）
+//   admins  : 配列（文字列）… 管理者のユーザーUID
+//   members : 配列（文字列）… 照合だけするユーザーのUID（空でもよい）
+//
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function signedIn() {
+      return request.auth != null
+          && request.auth.token.firebase.sign_in_provider == 'password';
+    }
+    function access() {
+      return get(/databases/$(database)/documents/config/access).data;
+    }
+    function isAdmin() {
+      return signedIn() && request.auth.uid in access().get('admins', []);
+    }
+    function isMember() {
+      return isAdmin() || (signedIn() && request.auth.uid in access().get('members', []));
+    }
+
+    // ---- 許可リスト（コンソールからだけ編集） ----
+    match /config/access {
+      allow read: if isMember();
+      allow write: if false;
+    }
+
+    // ---- 全タブレット共通の設定（標準しきい値） ----
+    match /config/settings {
+      allow read: if isMember();
+      allow create, update: if isAdmin()
+          && request.resource.data.keys().hasOnly(['defaultThreshold', 'updatedAt', 'updatedBy'])
+          && request.resource.data.defaultThreshold is number
+          && request.resource.data.defaultThreshold >= 1
+          && request.resource.data.defaultThreshold <= 99;
+      allow delete: if false;
+    }
+
+    // ---- 品番 ----
+    match /parts/{partId} {
+      function validPart(d) {
+        return d.keys().hasOnly(['partNo', 'name', 'threshold', 'masterIds', 'updatedAt', 'updatedBy'])
+            && d.partNo is string && d.partNo.size() >= 1 && d.partNo.size() <= 64
+            && d.name is string && d.name.size() <= 100
+            && d.masterIds is list && d.masterIds.size() <= 20
+            && (!d.keys().hasAny(['threshold'])
+                || (d.threshold is number && d.threshold >= 1 && d.threshold <= 99));
+      }
+      allow read: if isMember();
+      allow create, update: if isAdmin() && validPart(request.resource.data);
+      allow delete: if isAdmin();
+    }
+
+    // ---- マスター写真（1枚につき1ドキュメント。JPEG を 400KB 以下で） ----
+    match /masters/{masterId} {
+      allow read: if isMember();
+      allow create: if isAdmin()
+          && request.resource.data.keys().hasOnly(['partNo', 'photo', 'createdAt', 'createdBy', 'bytes'])
+          && request.resource.data.partNo is string
+          && request.resource.data.partNo.size() >= 1 && request.resource.data.partNo.size() <= 64
+          && request.resource.data.photo is bytes
+          && request.resource.data.photo.size() > 0
+          && request.resource.data.photo.size() <= 409600;
+      allow update: if false;
+      allow delete: if isAdmin();
+    }
+
+    // 上記以外はすべて拒否
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}

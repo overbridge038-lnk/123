@@ -15,6 +15,8 @@
 
 <div id="modelBar" class="model-bar">AIモデルを読み込み中…（初回のみ少し時間がかかります）</div>
 
+<div id="gate" class="gate" hidden></div>
+
 <main id="views">
 
   <!-- ============ 照合 ============ -->
@@ -24,6 +26,8 @@
       <span id="partBtnText" class="part-text">タップして品番を選ぶ</span>
       <span class="part-arrow">▼</span>
     </button>
+
+    <div id="syncLine" class="sync-line"></div>
 
     <div class="panes">
       <div class="pane">
@@ -58,8 +62,8 @@
   <section id="view-master" class="view">
     <div id="masterList">
       <div class="bar">
-        <h2>品番とマスター写真</h2>
-        <button id="addPartBtn" class="btn primary" type="button">＋ 品番を追加</button>
+        <h2 id="masterTitle">品番とマスター写真</h2>
+        <button id="addPartBtn" class="btn primary admin-only" type="button">＋ 品番を追加</button>
       </div>
       <input id="partSearch" class="input" type="search" placeholder="品番・品名で検索">
       <div id="partCards" class="cards"></div>
@@ -70,7 +74,7 @@
         <button id="editBackBtn" class="btn" type="button">← 戻る</button>
         <h2 id="editTitle"></h2>
       </div>
-      <div class="card-block">
+      <div class="card-block admin-only">
         <label class="field-label">品名</label>
         <div class="row">
           <input id="editName" class="input" type="text" placeholder="品名（省略可）">
@@ -80,23 +84,23 @@
       <div class="card-block">
         <label class="field-label">OK / NG のしきい値（類似度 %）</label>
         <div class="stepper">
-          <button id="thMinus" class="btn step" type="button">−</button>
+          <button id="thMinus" class="btn step admin-only" type="button">−</button>
           <div id="thValue" class="step-val">70%</div>
-          <button id="thPlus" class="btn step" type="button">＋</button>
-          <button id="thReset" class="btn" type="button">標準に戻す</button>
+          <button id="thPlus" class="btn step admin-only" type="button">＋</button>
+          <button id="thReset" class="btn admin-only" type="button">標準に戻す</button>
         </div>
-        <p class="hint">類似度がこの値以上なら OK、未満なら NG。誤判定が出たら履歴の類似度を見て調整します。</p>
+        <p class="hint">類似度がこの値以上なら OK、未満なら NG。全タブレット共通です（変更できるのは管理者だけ）。</p>
       </div>
       <div class="card-block">
-        <label class="field-label">マスター写真（角度違いを数枚登録すると安定します）</label>
-        <div class="row wrap">
+        <label class="field-label" id="mastersLabel">マスター写真（角度違いを数枚登録すると安定します）</label>
+        <div class="row wrap admin-only">
           <button id="camAddBtn" class="btn primary" type="button">カメラで撮影して追加</button>
           <button id="fileAddBtn" class="btn" type="button">写真ファイルから追加</button>
         </div>
         <input id="addFile" type="file" accept="image/*" multiple hidden>
         <div id="editMasters" class="master-grid"></div>
       </div>
-      <div class="card-block">
+      <div class="card-block admin-only">
         <button id="delPartBtn" class="btn danger" type="button">この品番を削除</button>
       </div>
     </div>
@@ -130,14 +134,23 @@
     <div class="card-block">
       <label class="field-label">標準のしきい値（類似度 %）</label>
       <div class="stepper">
-        <button id="dthMinus" class="btn step" type="button">−</button>
+        <button id="dthMinus" class="btn step admin-only" type="button">−</button>
         <div id="dthValue" class="step-val">70%</div>
-        <button id="dthPlus" class="btn step" type="button">＋</button>
+        <button id="dthPlus" class="btn step admin-only" type="button">＋</button>
       </div>
-      <p class="hint">品番ごとにしきい値を決めていない場合に使われます。</p>
+      <p class="hint">品番ごとにしきい値を決めていない場合に使われます。全タブレット共通で、変更できるのは管理者だけです。</p>
     </div>
     <div class="card-block">
-      <label class="field-label" for="operator">作業者名（履歴に記録されます）</label>
+      <label class="field-label">アカウントとクラウド同期</label>
+      <div id="acctInfo" class="hint"></div>
+      <div id="syncInfo" class="hint"></div>
+      <div class="row wrap">
+        <button id="syncBtn" class="btn primary" type="button">今すぐ同期</button>
+        <button id="logoutBtn" class="btn" type="button">ログアウト</button>
+      </div>
+    </div>
+    <div class="card-block">
+      <label class="field-label" for="operator">作業者名（履歴に記録されます。空ならメールアドレス）</label>
       <input id="operator" class="input" type="text" placeholder="例：山田">
     </div>
     <div class="card-block">
@@ -151,8 +164,8 @@
       <div id="appInfo" class="hint"></div>
     </div>
     <div class="card-block">
-      <button id="wipeBtn" class="btn danger" type="button">すべてのデータを削除</button>
-      <p class="hint">登録した品番・マスター写真・履歴をすべて消します。元に戻せません。</p>
+      <button id="wipeBtn" class="btn danger" type="button">この端末のデータを削除</button>
+      <p class="hint">この端末に保存されたマスター写真のコピーと履歴を消します。クラウド上のマスターは消えません（次の同期で再取得されます）。履歴は元に戻せません。</p>
     </div>
   </section>
 
@@ -160,7 +173,7 @@
 
 <nav id="tabs" class="tabs">
   <button type="button" data-view="verify" class="on"><span class="ico">✔</span>照合</button>
-  <button type="button" data-view="master"><span class="ico">📷</span>登録</button>
+  <button type="button" data-view="master"><span class="ico">📷</span><span id="masterTabLbl">マスター</span></button>
   <button type="button" data-view="history"><span class="ico">🕘</span>履歴</button>
   <button type="button" data-view="settings"><span class="ico">⚙</span>設定</button>
 </nav>
@@ -169,6 +182,11 @@
 <div id="toast" class="toast" hidden></div>
 
 <script src="vendor/tf.min.js"></script>
+<script src="vendor/firebase/firebase-app-compat.js"></script>
+<script src="vendor/firebase/firebase-auth-compat.js"></script>
+<script src="vendor/firebase/firebase-firestore-compat.js"></script>
+<script src="firebase-config.js"></script>
+<script src="cloud.js"></script>
 <script src="app.js"></script>
 </body>
 </html>

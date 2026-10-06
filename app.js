@@ -1,16 +1,22 @@
 'use strict';
 /* 誤品照合アプリ
  * - 写真の特徴量を MobileNetV2（同梱モデル）で数値化し、コサイン類似度で OK / NG を判定
- * - データはすべて IndexedDB（このタブレット内）に保存。外部へは送信しません。
+ * - マスター（品番・写真）は Firebase（Firestore）で全タブレットと共有し、各端末の IndexedDB にもコピーして保存
+ *   → 照合はオフラインでも動く。照合の計算（特徴量・類似度）は端末内だけで行う
+ * - 現品の写真・履歴は、このタブレットの中にだけ保存。クラウドへは送りません。
+ * - 管理者だけがマスターを登録・変更・削除できる（クラウド側のセキュリティルールでも強制）
  */
 
 /* ================= 設定値 ================= */
-const APP_VERSION = '1.0.0';
+const APP_VERSION = '2.0.0';
 const MODEL_URL = 'model/model.json';
 const FEATURE_NODE = 'module_apply_default/MobilenetV2/Conv_1/Relu6'; // 7x7x1280 の特徴マップ
 const MODEL_VER = 'mnv2-1';       // モデルや計算方法を変えたら必ず変更（登録済み写真の特徴量を再計算するため）
 const INPUT_SIZE = 224;
-const MASTER_SIZE = 512;          // 保存するマスター写真の一辺(px)
+const MASTER_SIZE = 640;          // マスター写真の一辺(px)。長辺800px以内
+const MASTER_MAX_BYTES = 400 * 1024; // クラウドに置く1枚の上限
+const MAX_MASTERS = 20;           // 1品番あたりのマスター写真の上限
+const SYNC_STALE_MS = 10 * 60 * 1000; // この時間を過ぎたら、画面を開いたときに自動で同期
 const HIST_THUMB = 320;           // 履歴に残す現品写真の一辺(px)
 const DEFAULT_THRESHOLD = 70;     // 標準しきい値(%)。実際の品物で必ず調整してください
 const W_GLOBAL = 0.6;             // 全体の特徴の重み
@@ -26,13 +32,17 @@ let dbPromise = null;
 function openDB() {
   if (!dbPromise) {
     dbPromise = new Promise((resolve, reject) => {
-      const r = indexedDB.open('gohin-db', 1);
-      r.onupgradeneeded = () => {
+      const r = indexedDB.open('gohin-db', 2);
+      r.onupgradeneeded = e => {
         const db = r.result;
-        db.createObjectStore('parts', { keyPath: 'partNo' });
-        db.createObjectStore('masters', { keyPath: 'id', autoIncrement: true }).createIndex('partNo', 'partNo');
-        db.createObjectStore('history', { keyPath: 'id', autoIncrement: true });
-        db.createObjectStore('kv');
+        if (e.oldVersion < 1) {
+          db.createObjectStore('history', { keyPath: 'id', autoIncrement: true });
+          db.createObjectStore('kv');
+        }
+        if (e.oldVersion < 2) {   // v2：クラウドのマスターのコピー（旧 parts / masters は使わず、あれば残すだけ）
+          db.createObjectStore('cparts', { keyPath: 'partNo' });
+          db.createObjectStore('cmasters', { keyPath: 'id' }).createIndex('partNo', 'partNo');
+        }
       };
       r.onsuccess = () => resolve(r.result);
       r.onerror = () => reject(r.error);
@@ -53,22 +63,29 @@ const dbGet = (s, k) => dbDo(s, 'readonly', o => o.get(k));
 const dbPut = (s, v, k) => dbDo(s, 'readwrite', o => o.put(v, k));
 const dbDel = (s, k) => dbDo(s, 'readwrite', o => o.delete(k));
 const dbClear = s => dbDo(s, 'readwrite', o => o.clear());
-const mastersOf = partNo => dbDo('masters', 'readonly', o => o.index('partNo').getAll(partNo));
+const mastersOf = partNo => dbDo('cmasters', 'readonly', o => o.index('partNo').getAll(partNo));
 const kvGet = async (k, d) => { const v = await dbGet('kv', k); return v === undefined ? d : v; };
 const kvSet = (k, v) => dbPut('kv', v, k);
 
-async function deletePart(partNo) {
+async function deletePartLocal(partNo) {
   const db = await openDB();
   await new Promise((resolve, reject) => {
-    const t = db.transaction(['parts', 'masters'], 'readwrite');
-    t.objectStore('parts').delete(partNo);
-    const idx = t.objectStore('masters').index('partNo');
+    const t = db.transaction(['cparts', 'cmasters'], 'readwrite');
+    t.objectStore('cparts').delete(partNo);
+    const idx = t.objectStore('cmasters').index('partNo');
     idx.openKeyCursor(IDBKeyRange.only(partNo)).onsuccess = e => {
       const c = e.target.result;
-      if (c) { t.objectStore('masters').delete(c.primaryKey); c.continue(); }
+      if (c) { t.objectStore('cmasters').delete(c.primaryKey); c.continue(); }
     };
     t.oncomplete = resolve; t.onerror = t.onabort = () => reject(t.error);
   });
+}
+/** 端末内のコピーを消す。all=true なら履歴と旧バージョンのデータも消す */
+async function wipeLocal(all) {
+  const db = await openDB();
+  const names = ['cparts', 'cmasters'];
+  if (all) names.push('history', ...['parts', 'masters'].filter(n => db.objectStoreNames.contains(n)));
+  for (const n of names) await dbClear(n);
 }
 
 /* ================= 設定の読み書き ================= */
@@ -252,16 +269,47 @@ async function ensureEmbedding(m) {   // 特徴量が無い／古いモデルの
   if (m.emb && m.emb.v === MODEL_VER) return m;
   const c = await canvasFromFile(m.blob);
   m.emb = await embed(c);
-  await dbPut('masters', m);
+  await dbPut('cmasters', m);
   return m;
 }
-async function addMasterFromCanvas(partNo, canvas) {
-  const blob = await toBlob(canvas, 0.9);
-  const emb = await embed(canvas);
-  await dbPut('masters', { partNo, blob, emb, createdAt: Date.now() });
+/** クラウドに置ける大きさ（400KB以下）の JPEG にする */
+async function compressMaster(canvas) {
+  let c = canvas, q = 0.8;
+  for (let i = 0; i < 8; i++) {
+    const b = await toBlob(c, q);
+    if (b && b.size <= MASTER_MAX_BYTES) return b;
+    if (q > 0.5) q -= 0.1; else c = shrink(c, Math.round(c.width * 0.85));
+  }
+  throw new Error('写真を400KB以下にできませんでした');
+}
+/** マスター写真を1枚登録：クラウドへ保存 → この端末にも保存（特徴量つき） */
+async function registerMaster(partNo, canvas) {
+  if ((await mastersOf(partNo)).length >= MAX_MASTERS) throw new Error(`1つの品番に登録できるのは${MAX_MASTERS}枚までです`);
+  const blob = await compressMaster(canvas);
+  const id = await Cloud.addMaster(partNo, blob, Auth.user.email);
+  let emb = null;
+  try { emb = await embed(await canvasFromFile(blob)); } catch (e) { console.warn('特徴量の計算を後回しにします', e); }
+  await dbPut('cmasters', { id, partNo, blob, emb, createdAt: Date.now(), createdBy: Auth.user.email });
+  const p = await dbGet('cparts', partNo);
+  if (p) { p.masterIds = [...(p.masterIds || []), id]; await dbPut('cparts', p); }
+}
+function cloudErrorText(e) {
+  const c = (e && e.code) || '';
+  if (c === 'permission-denied') return '権限がありません（変更できるのは管理者だけです）';
+  if (c === 'already-exists') return e.message;
+  if (c === 'not-found') return 'クラウド上に見つかりません。「今すぐ同期」を押してからもう一度お試しください';
+  if (c === 'unavailable' || c === 'timeout' || /network|offline|Failed to get/i.test((e && e.message) || '')) return '通信できませんでした。電波を確認してもう一度お試しください';
+  return (e && e.message) || 'エラーが発生しました';
+}
+/** 管理者だけの操作を安全に実行する（権限・オンライン確認、失敗時の表示、失敗後の再同期） */
+async function adminDo(fn) {
+  if (!Auth.isAdmin) { toast('この操作は管理者だけができます'); return false; }
+  if (!navigator.onLine) { toast('オフラインです。ネットに繋いでから操作してください', 3500); return false; }
+  try { await fn(); return true; }
+  catch (e) { console.error(e); toast(cloudErrorText(e), 5000); setTimeout(() => Sync.run(), 3000); return false; }
 }
 async function pickPart(currentNo) {
-  const parts = (await dbAll('parts')).sort((a, b) => a.partNo.localeCompare(b.partNo, 'ja', { numeric: true }));
+  const parts = (await dbAll('cparts')).sort((a, b) => a.partNo.localeCompare(b.partNo, 'ja', { numeric: true }));
   return openDialog((d, close) => {
     d.innerHTML = `<h3>品番を選ぶ</h3><input class="input" type="search" placeholder="品番・品名で検索"><div class="pick-list"></div><div class="row"><button class="btn">閉じる</button></div>`;
     const list = $('.pick-list', d), inp = $('input', d);
@@ -312,9 +360,19 @@ const verify = {
     };
   },
 
+  async refresh() {          // 同期後に、選択中の品番とマスターを読み直す（カメラは止めない）
+    const p = this.part ? await dbGet('cparts', this.part.partNo) : null;
+    this.part = p || null;
+    const keep = this.masters[this.shown] && this.masters[this.shown].id;
+    await this.loadMasters();
+    const i = this.masters.findIndex(m => m.id === keep);
+    if (i >= 0) this.shown = i;
+    this.render();
+  },
+
   async enter() {
     keepAwake(true);
-    const parts = await dbAll('parts');
+    const parts = await dbAll('cparts');
     const last = await kvGet('lastPart', null);
     if (!this.part || !parts.find(p => p.partNo === this.part.partNo)) {
       this.part = parts.find(p => p.partNo === last) || null;
@@ -323,7 +381,7 @@ const verify = {
     }
     await this.loadMasters();
     this.render();
-    if (!parts.length) this.setResult('idle', '待機中', '「登録」タブで品番とマスター写真を登録してください');
+    if (!parts.length) this.setResult('idle', '待機中', Auth.isAdmin ? '「登録」タブで品番とマスター写真を登録してください' : '管理者がマスターを登録すると使えます。「設定」の「今すぐ同期」を押してください');
     if (this.state === 'result') return;
     this.state = 'live';
     this.startCamera();
@@ -339,7 +397,7 @@ const verify = {
   async choosePart() {
     const no = await pickPart(this.part && this.part.partNo);
     if (!no) return;
-    this.part = await dbGet('parts', no);
+    this.part = await dbGet('cparts', no);
     await kvSet('lastPart', no);
     await this.loadMasters();
     this.state = 'live';
@@ -356,7 +414,7 @@ const verify = {
     const img = $('#masterImg'), empty = $('#masterEmpty'), th = $('#masterThumbs');
     th.innerHTML = '';
     if (!this.part) { img.removeAttribute('src'); img.hidden = true; empty.hidden = false; empty.textContent = '品番を選んでください'; }
-    else if (!this.masters.length) { img.hidden = true; empty.hidden = false; empty.textContent = 'この品番にはマスター写真がありません。「登録」タブで追加してください'; }
+    else if (!this.masters.length) { img.hidden = true; empty.hidden = false; empty.textContent = Auth.isAdmin ? 'この品番にはマスター写真がありません。「登録」タブで追加してください' : 'この品番にはマスター写真がありません。管理者に連絡してください'; }
     else {
       empty.hidden = true; img.hidden = false;
       img.src = mkUrl('verify', this.masters[this.shown].blob);
@@ -403,6 +461,7 @@ const verify = {
   async onShoot() {
     if (this.state === 'result') {           // 次の照合へ
       this.state = 'live'; this.bestId = null; this.showLive();
+      await this.refresh();
       this.setResult('idle', '待機中', '現品を四角の中に入れて「撮影して照合」を押してください');
       this.render(); if (!this.cam.active) this.startCamera();
       return;
@@ -435,7 +494,7 @@ const verify = {
       const photo = await toBlob(shrink(canvas, HIST_THUMB), 0.8);
       await dbPut('history', {
         ts: Date.now(), partNo: this.part.partNo, partName: this.part.name || '', score: score1, threshold,
-        result: ok ? 'OK' : 'NG', operator: settings.operator, masterId: best.id, photo
+        result: ok ? 'OK' : 'NG', operator: settings.operator || (Auth.user && Auth.user.email) || '', masterId: best.id, photo
       });
     } catch (e) {
       console.error(e);
@@ -445,7 +504,7 @@ const verify = {
   }
 };
 
-/* ================= 登録画面 ================= */
+/* ================= 登録画面（管理者は編集、それ以外は閲覧のみ） ================= */
 const master = {
   editing: null,
   init() {
@@ -453,17 +512,24 @@ const master = {
     $('#partSearch').oninput = () => this.renderList();
     $('#editBackBtn').onclick = () => this.closeEdit();
     $('#saveNameBtn').onclick = async () => {
-      this.editing.name = $('#editName').value.trim(); await dbPut('parts', this.editing); toast('保存しました');
+      const p = this.editing, name = $('#editName').value.trim();
+      if (await adminDo(() => Cloud.updatePart(p.partNo, { name }, Auth.user.email))) {
+        p.name = name; await dbPut('cparts', p); $('#editTitle').textContent = p.partNo + (name ? '  ' + name : ''); toast('保存しました');
+      }
     };
     $('#thMinus').onclick = () => this.stepTh(-1);
     $('#thPlus').onclick = () => this.stepTh(1);
-    $('#thReset').onclick = async () => { delete this.editing.threshold; await dbPut('parts', this.editing); this.renderTh(); };
+    $('#thReset').onclick = async () => {
+      const p = this.editing; clearTimeout(this.thTimer);
+      if (await adminDo(() => Cloud.updatePart(p.partNo, { threshold: null }, Auth.user.email))) { delete p.threshold; await dbPut('cparts', p); this.renderTh(); }
+    };
     $('#camAddBtn').onclick = () => this.addByCamera();
     $('#fileAddBtn').onclick = () => $('#addFile').click();
     $('#addFile').onchange = e => this.addByFiles([...e.target.files]).then(() => { e.target.value = ''; });
     $('#delPartBtn').onclick = async () => {
-      if (!await ask(`品番「${this.editing.partNo}」とマスター写真を削除します。よろしいですか？`, '削除する', true)) return;
-      await deletePart(this.editing.partNo); this.closeEdit(); toast('削除しました');
+      const p = this.editing;
+      if (!await ask(`品番「${p.partNo}」とマスター写真を、全タブレットから削除します。よろしいですか？`, '削除する', true)) return;
+      if (await adminDo(() => Cloud.deletePart(p.partNo))) { await deletePartLocal(p.partNo); this.closeEdit(); toast('削除しました'); }
     };
   },
   async enter() { if (this.editing) await this.openEdit(this.editing.partNo); else await this.renderList(); },
@@ -471,11 +537,11 @@ const master = {
   async renderList() {
     clearUrls('plist');
     const q = $('#partSearch').value.trim().toLowerCase();
-    const parts = (await dbAll('parts')).sort((a, b) => a.partNo.localeCompare(b.partNo, 'ja', { numeric: true }));
-    const masters = await dbAll('masters');
+    const parts = (await dbAll('cparts')).sort((a, b) => a.partNo.localeCompare(b.partNo, 'ja', { numeric: true }));
+    const masters = await dbAll('cmasters');
     const cards = $('#partCards'); cards.innerHTML = '';
     const hit = parts.filter(p => !q || p.partNo.toLowerCase().includes(q) || (p.name || '').toLowerCase().includes(q));
-    if (!hit.length) cards.innerHTML = `<div class="hint">${parts.length ? '該当なし' : '品番がまだありません。「＋ 品番を追加」を押してください。'}</div>`;
+    if (!hit.length) cards.innerHTML = `<div class="hint">${parts.length ? '該当なし' : (Auth.isAdmin ? '品番がまだありません。「＋ 品番を追加」を押してください。' : '品番がまだありません。管理者が登録すると表示されます（「設定」の「今すぐ同期」）。')}</div>`;
     hit.forEach(p => {
       const ms = masters.filter(m => m.partNo === p.partNo).sort((a, b) => a.createdAt - b.createdAt);
       const b = document.createElement('button'); b.className = 'pcard';
@@ -492,28 +558,30 @@ const master = {
     if (!r) return;
     const [partNo, name] = r;
     if (!partNo) { toast('品番を入力してください'); return; }
-    if (await dbGet('parts', partNo)) { toast('その品番はすでにあります'); return; }
-    await dbPut('parts', { partNo, name, createdAt: Date.now() });
-    await this.openEdit(partNo);
+    if (partNo.length > 64 || name.length > 100) { toast('品番は64文字、品名は100文字までです'); return; }
+    if (await adminDo(() => Cloud.createPart(partNo, name, Auth.user.email))) {
+      await dbPut('cparts', { partNo, name, masterIds: [], updatedAt: Date.now() });
+      await this.openEdit(partNo);
+    }
   },
 
   async openEdit(partNo) {
-    const p = await dbGet('parts', partNo);
+    const p = await dbGet('cparts', partNo);
     if (!p) { this.closeEdit(); return; }
     this.editing = p;
     $('#masterList').hidden = true; $('#partEdit').hidden = false;
-    $('#editTitle').textContent = p.partNo; $('#editName').value = p.name || '';
+    $('#editTitle').textContent = p.partNo + (p.name ? '  ' + p.name : ''); $('#editName').value = p.name || '';
     this.renderTh(); await this.renderMasters();
   },
   closeEdit() { this.editing = null; clearUrls('medit'); $('#partEdit').hidden = true; $('#masterList').hidden = false; this.renderList(); },
 
-  renderTh() {
-    const v = thresholdOf(this.editing);
-    $('#thValue').textContent = v + '%';
-  },
-  async stepTh(d) {
-    const v = Math.max(1, Math.min(99, thresholdOf(this.editing) + d));
-    this.editing.threshold = v; await dbPut('parts', this.editing); this.renderTh();
+  renderTh() { $('#thValue').textContent = thresholdOf(this.editing) + '%'; },
+  stepTh(d) {   // 画面はすぐ変え、0.8秒操作が止まったらクラウドへ保存
+    const p = this.editing;
+    const v = Math.max(1, Math.min(99, thresholdOf(p) + d));
+    p.threshold = v; dbPut('cparts', p); this.renderTh();
+    clearTimeout(this.thTimer);
+    this.thTimer = setTimeout(() => adminDo(() => Cloud.updatePart(p.partNo, { threshold: v }, Auth.user.email)), 800);
   },
 
   async renderMasters() {
@@ -522,10 +590,17 @@ const master = {
     const g = $('#editMasters'); g.innerHTML = ms.length ? '' : '<div class="hint">マスター写真がまだありません</div>';
     ms.forEach(m => {
       const c = document.createElement('div'); c.className = 'mcell';
-      c.innerHTML = `<img src="${mkUrl('medit', m.blob)}" alt=""><button type="button" aria-label="削除">×</button>`;
-      c.querySelector('button').onclick = async () => {
-        if (!await ask('このマスター写真を削除しますか？', '削除する', true)) return;
-        await dbDel('masters', m.id); this.renderMasters();
+      c.innerHTML = `<img src="${mkUrl('medit', m.blob)}" alt="">` + (Auth.isAdmin ? '<button type="button" aria-label="削除">×</button>' : '');
+      const del = c.querySelector('button');
+      if (del) del.onclick = async () => {
+        if (!await ask('このマスター写真を、全タブレットから削除しますか？', '削除する', true)) return;
+        const partNo = this.editing.partNo;
+        if (await adminDo(() => Cloud.deleteMaster(partNo, m.id, Auth.user.email))) {
+          await dbDel('cmasters', m.id);
+          const p = await dbGet('cparts', partNo);
+          if (p) { p.masterIds = (p.masterIds || []).filter(x => x !== m.id); await dbPut('cparts', p); }
+          this.renderMasters();
+        }
       };
       g.appendChild(c);
     });
@@ -533,11 +608,11 @@ const master = {
 
   async addByFiles(files) {
     if (!files.length) return;
-    toast('登録中…', 60000);
-    try {
-      for (const f of files) await addMasterFromCanvas(this.editing.partNo, await canvasFromFile(f));
-      toast(files.length + '枚 登録しました');
-    } catch (e) { toast('登録に失敗しました：' + e.message, 4000); }
+    const partNo = this.editing.partNo;
+    toast('クラウドへ登録中…', 120000);
+    let n = 0;
+    const ok = await adminDo(async () => { for (const f of files) { await registerMaster(partNo, await canvasFromFile(f)); n++; } });
+    if (ok) toast(n + '枚 登録しました');
     this.renderMasters();
   },
 
@@ -547,7 +622,7 @@ const master = {
     await openDialog((d, close) => {
       d.innerHTML = `<h3>マスター写真を撮影（${esc(partNo)}）</h3>
         <div class="square"><video playsinline muted autoplay></video><img hidden alt=""><div class="empty" hidden></div></div>
-        <div class="hint" id="camHelp">四角の中央が登録される範囲です。現品を真ん中に置いてください。</div>
+        <div class="hint" id="camHelp">四角の中央が登録される範囲です。現品を真ん中に置いてください。登録した写真は全タブレットに共有されます。</div>
         <div class="row"><button class="btn" id="cClose">閉じる</button><button class="btn primary" id="cShoot">撮影</button></div>`;
       const cam = new Camera($('video', d)), img = $('img', d), msg = $('.empty', d), shoot = $('#cShoot', d);
       let mode = 'live', shot = null;
@@ -563,8 +638,7 @@ const master = {
           $('#cClose', d).onclick = () => { URL.revokeObjectURL(img.src); img.hidden = true; $('video', d).hidden = false; mode = 'live'; shoot.textContent = '撮影'; $('#cClose', d).textContent = '閉じる'; $('#cClose', d).onclick = finish; };
         } else {
           shoot.disabled = true; shoot.textContent = '登録中…';
-          try { await addMasterFromCanvas(partNo, shot); added++; toast('登録しました（' + added + '枚）'); this.renderMasters(); }
-          catch (e) { toast('登録に失敗：' + e.message, 4000); }
+          if (await adminDo(() => registerMaster(partNo, shot))) { added++; toast('登録しました（' + added + '枚）'); this.renderMasters(); }
           URL.revokeObjectURL(img.src); img.hidden = true; $('video', d).hidden = false;
           mode = 'live'; shoot.disabled = false; shoot.textContent = '続けて撮影'; $('#cClose', d).textContent = '終了';
           $('#cClose', d).onclick = finish;
@@ -648,18 +722,28 @@ function fmtDate(ts) {
 
 /* ================= 設定画面 ================= */
 const settingsView = {
+  thTimer: null,
   init() {
-    const step = d => async () => {
-      await saveSetting('defaultThreshold', Math.max(1, Math.min(99, settings.defaultThreshold + d))); this.fill();
+    const step = d => () => {   // 管理者だけ。画面はすぐ変え、操作が止まったらクラウドへ保存
+      const v = Math.max(1, Math.min(99, settings.defaultThreshold + d));
+      saveSetting('defaultThreshold', v); this.fill();
+      clearTimeout(this.thTimer);
+      this.thTimer = setTimeout(() => adminDo(() => Cloud.saveDefaultThreshold(v, Auth.user.email)), 800);
     };
     $('#dthMinus').onclick = step(-1); $('#dthPlus').onclick = step(1);
     $('#operator').oninput = e => saveSetting('operator', e.target.value.trim());
     $('#optSound').onchange = e => { saveSetting('sound', e.target.checked); if (e.target.checked) beep(1200, 0.15); };
     $('#optVibrate').onchange = e => { saveSetting('vibrate', e.target.checked); if (e.target.checked && navigator.vibrate) navigator.vibrate(150); };
+    $('#syncBtn').onclick = async () => { if (!navigator.onLine) { toast('オフラインです。ネットに繋いでください'); return; } await Sync.run(true); this.fill(); };
+    $('#logoutBtn').onclick = async () => {
+      if (!await ask('ログアウトしますか？ もう一度ログインするには、ネット接続が必要です。', 'ログアウト', true)) return;
+      await Cloud.logout();
+    };
     $('#wipeBtn').onclick = async () => {
-      if (!await ask('品番・マスター写真・履歴をすべて削除します。本当によろしいですか？', 'すべて削除する', true)) return;
-      for (const s of ['parts', 'masters', 'history']) await dbClear(s);
-      verify.part = null; await kvSet('lastPart', null); toast('削除しました'); this.fill();
+      if (!await ask('この端末の履歴とマスターのコピーを削除します（クラウドのマスターは消えません）。本当によろしいですか？', 'すべて削除する', true)) return;
+      await wipeLocal(true);
+      verify.part = null; await kvSet('lastPart', null); await kvSet('lastSync', 0); Sync.last = 0;
+      toast('削除しました'); this.fill(); Sync.run();
     };
   },
   async enter() { this.fill(); },
@@ -667,26 +751,210 @@ const settingsView = {
     $('#dthValue').textContent = settings.defaultThreshold + '%';
     $('#operator').value = settings.operator;
     $('#optSound').checked = settings.sound; $('#optVibrate').checked = settings.vibrate;
-    const [np, nm, nh] = [(await dbAll('parts')).length, (await dbAll('masters')).length, (await dbAll('history')).length];
+    $('#acctInfo').textContent = Auth.user ? `ログイン中：${Auth.user.email}／権限：${Auth.isAdmin ? '管理者（マスターの登録・変更ができます）' : '照合のみ'}` : '';
+    Sync.render();
+    const [np, nm, nh] = [(await dbAll('cparts')).length, (await dbAll('cmasters')).length, (await dbAll('history')).length];
     let usage = '';
     try {
       const e = await navigator.storage.estimate();
       const persisted = navigator.storage.persisted ? await navigator.storage.persisted() : false;
       usage = `／使用 ${(e.usage / 1048576).toFixed(1)}MB（${persisted ? 'データ保護：有効' : 'データ保護：未設定'}）`;
     } catch (e) { /* 取得できなくても続行 */ }
-    $('#storageInfo').textContent = `品番 ${np}件／マスター写真 ${nm}枚／履歴 ${nh}件${usage}`;
+    $('#storageInfo').textContent = `この端末にあるマスター：品番 ${np}件／写真 ${nm}枚／履歴 ${nh}件${usage}`;
     $('#appInfo').textContent = `バージョン ${APP_VERSION}／モデル ${MODEL_VER}／${navigator.onLine ? 'オンライン' : 'オフライン'}／${('serviceWorker' in navigator && navigator.serviceWorker.controller) ? 'オフライン動作：準備OK' : 'オフライン動作：準備中（一度ネットに繋いだまま開いてください）'}`;
   }
 };
+
+/* ================= クラウド同期 ================= */
+const Sync = {
+  running: false, last: 0, state: 'idle', detail: '',
+  setState(state, detail = '') { this.state = state; this.detail = detail; this.render(); },
+  render() {
+    const t = this.last ? fmtTime(this.last) : '未同期';
+    let txt, cls = '';
+    if (this.state === 'syncing') txt = '☁ 同期中… ' + this.detail;
+    else if (this.state === 'error') { txt = '☁ 同期できませんでした' + (this.detail ? '（' + this.detail + '）' : '') + '。端末内のマスターで照合できます（最終同期 ' + t + '）'; cls = 'err'; }
+    else if (!navigator.onLine) { txt = `☁ オフライン：端末内のマスターで照合中（最終同期 ${t}）`; cls = 'warn'; }
+    else txt = `☁ 同期済み（最終 ${t}）`;
+    const line = $('#syncLine'); if (line) { line.textContent = txt; line.className = 'sync-line ' + cls; }
+    const info = $('#syncInfo'); if (info) info.textContent = txt.replace('☁ ', '');
+  },
+  /** クラウドの内容に、この端末のコピーをそろえる（写真は新しいものだけダウンロード） */
+  async run() {
+    if (this.running || !Auth.role) return;
+    if (!navigator.onLine) { this.render(); return; }
+    this.running = true; this.setState('syncing');
+    try {
+      const st = await Cloud.fetchSettings();
+      if (st && typeof st.defaultThreshold === 'number') await saveSetting('defaultThreshold', st.defaultThreshold);
+
+      const parts = await Cloud.fetchParts();
+      const cloudNos = new Set(parts.map(p => p.partNo));
+      for (const lp of await dbAll('cparts')) if (!cloudNos.has(lp.partNo)) await deletePartLocal(lp.partNo);   // クラウドで削除された品番
+      for (const p of parts) {
+        const rec = { partNo: p.partNo, name: p.name, masterIds: p.masterIds, updatedAt: p.updatedAt };
+        if (typeof p.threshold === 'number') rec.threshold = p.threshold;
+        await dbPut('cparts', rec);
+      }
+
+      const want = new Map();
+      parts.forEach(p => p.masterIds.forEach(id => want.set(id, p.partNo)));
+      const have = new Map((await dbAll('cmasters')).map(m => [m.id, m]));
+      for (const m of have.values()) if (want.get(m.id) !== m.partNo) await dbDel('cmasters', m.id);          // クラウドで削除された写真
+      const queue = [...want.keys()].filter(id => !have.has(id) || have.get(id).partNo !== want.get(id));
+      const total = queue.length; let done = 0, failed = 0;
+      const worker = async () => {
+        while (queue.length) {
+          const id = queue.shift();
+          try {
+            const m = await Cloud.fetchMaster(id);
+            if (m && m.partNo === want.get(id)) await dbPut('cmasters', m); else failed++;
+          } catch (e) { if (e.code === 'permission-denied') throw e; failed++; }
+          this.setState('syncing', `写真 ${++done}/${total}`);
+        }
+      };
+      await Promise.all([worker(), worker(), worker()]);
+
+      if (failed) { this.setState('error', `写真${failed}枚を取得できませんでした`); }
+      else { this.last = Date.now(); await kvSet('lastSync', this.last); this.setState('ok'); }
+      await refreshAfterSync();
+    } catch (e) {
+      if (e.code === 'permission-denied') { this.running = false; await Auth.recheck(); return; }
+      console.error(e); this.setState('error', cloudErrorText(e));
+    } finally { this.running = false; }
+  }
+};
+function fmtTime(ts) {
+  const d = new Date(ts), p = x => String(x).padStart(2, '0'), n = new Date();
+  const hm = `${p(d.getHours())}:${p(d.getMinutes())}`;
+  return d.toDateString() === n.toDateString() ? hm : `${d.getMonth() + 1}/${d.getDate()} ${hm}`;
+}
+async function refreshAfterSync() {
+  if (!$('#modal').hidden) return;                       // ダイアログを開いている間は画面を触らない
+  if (currentView === 'verify' && (verify.state === 'live' || verify.state === 'idle')) await verify.refresh();
+  else if (currentView === 'master') await master.enter();
+  else if (currentView === 'settings') settingsView.fill();
+}
+
+/* ================= ログイン・権限 ================= */
+const Gate = {
+  show(html, bind) {
+    verify.leave();
+    const g = $('#gate'); g.hidden = false; g.innerHTML = `<div class="gate-box">${html}</div>`;
+    if (bind) bind(g);
+  },
+  hide() { const g = $('#gate'); g.hidden = true; g.innerHTML = ''; },
+  config() {
+    this.show(`<h1>誤品照合</h1><p>クラウドの接続設定がまだです。</p>
+      <p class="hint">リポジトリの <b>firebase-config.js</b> に、Firebase の設定値を貼り付けてください（手順は <b>CLOUD_SETUP.md</b>）。</p>`);
+  },
+  login(msg = '') {
+    this.show(`<h1>誤品照合</h1><p class="hint">ログインしてください。アカウントは管理者が作成します。<br>初めてのログインは、ネットに繋いだ状態で行ってください。</p>
+      <label class="field-label" for="gEmail">メールアドレス</label>
+      <input id="gEmail" class="input" type="email" autocomplete="username" inputmode="email" autocapitalize="off">
+      <label class="field-label" for="gPass">パスワード</label>
+      <input id="gPass" class="input" type="password" autocomplete="current-password">
+      <div id="gErr" class="gate-err">${esc(msg)}</div>
+      <button id="gGo" class="btn primary big" type="button">ログイン</button>`, g => {
+      const email = $('#gEmail', g), pass = $('#gPass', g), err = $('#gErr', g), go = $('#gGo', g);
+      const submit = async () => {
+        if (!email.value.trim() || !pass.value) { err.textContent = 'メールアドレスとパスワードを入力してください'; return; }
+        if (!navigator.onLine) { err.textContent = 'ネットに繋がっていません。ネットに繋いでからログインしてください'; return; }
+        go.disabled = true; err.textContent = 'ログイン中…';
+        try { await Cloud.login(email.value.trim(), pass.value); }
+        catch (e) {
+          const c = (e && e.code) || '';
+          err.textContent = /invalid-credential|user-not-found|wrong-password|invalid-email/.test(c) ? 'メールアドレスまたはパスワードが違います'
+            : c === 'auth/too-many-requests' ? '失敗が続いたため、しばらく待ってからやり直してください'
+            : c === 'auth/user-disabled' ? 'このアカウントは使えなくなっています。管理者に連絡してください'
+            : /network|timeout/.test(c) ? '通信できませんでした。電波を確認してください'
+            : 'ログインできませんでした（' + (c || e.message) + '）';
+          go.disabled = false;
+        }
+      };
+      go.onclick = submit;
+      pass.onkeydown = email.onkeydown = e => { if (e.key === 'Enter') submit(); };
+    });
+  },
+  needOnline() {
+    this.show(`<h1>誤品照合</h1><p>このアカウントの権限を確認するため、ネットに繋ぐ必要があります。</p>
+      <button id="gRetry" class="btn primary big" type="button">もう一度確認する</button>
+      <button id="gOut" class="btn" type="button">ログアウト</button>`, g => {
+      $('#gRetry', g).onclick = () => Auth.recheck();
+      $('#gOut', g).onclick = () => Cloud.logout();
+    });
+  },
+  async denied(user) {
+    await wipeLocal(false);                              // 許可されていない人の端末には、マスターを残さない
+    verify.part = null;
+    this.show(`<h1>誤品照合</h1><p><b>このアカウントは、まだ使用を許可されていません。</b></p>
+      <p class="hint">下のIDを管理者に伝えて、許可してもらってください。許可されたら「もう一度確認する」を押します。</p>
+      <div class="uid-box" id="gUid">${esc(user.uid)}</div>
+      <p class="hint">ログイン中：${esc(user.email || '')}</p>
+      <button id="gCopy" class="btn" type="button">IDをコピー</button>
+      <button id="gRetry" class="btn primary" type="button">もう一度確認する</button>
+      <button id="gOut" class="btn" type="button">ログアウト</button>`, g => {
+      $('#gCopy', g).onclick = async () => {
+        try { await navigator.clipboard.writeText(user.uid); toast('コピーしました'); }
+        catch (e) { const r = document.createRange(); r.selectNodeContents($('#gUid', g)); const s = getSelection(); s.removeAllRanges(); s.addRange(r); toast('IDを選択しました。長押ししてコピーしてください', 4000); }
+      };
+      $('#gRetry', g).onclick = () => Auth.recheck();
+      $('#gOut', g).onclick = () => Cloud.logout();
+    });
+  }
+};
+
+const Auth = {
+  user: null, role: null,
+  get isAdmin() { return this.role === 'admin'; },
+  async onUser(user) {
+    this.user = user;
+    if (!user) { this.role = null; applyRoleUI(); Gate.login(); return; }
+    const key = 'role_' + user.uid;
+    let role = await kvGet(key, null);                    // オフライン起動のため、前回確認した権限を使う
+    if (navigator.onLine) {
+      try { role = await Cloud.fetchRole(user.uid); await kvSet(key, role); }
+      catch (e) { console.warn('権限を確認できませんでした', e); if (!role) { Gate.needOnline(); return; } }
+    } else if (!role) { Gate.needOnline(); return; }
+    if (role === 'none') { this.role = null; await Gate.denied(user); return; }
+    this.role = role;
+    applyRoleUI();
+    Gate.hide();
+    startAfterLogin();
+  },
+  async recheck() { if (this.user) await this.onUser(this.user); }
+};
+function applyRoleUI() {
+  $$('.admin-only').forEach(e => { e.hidden = !Auth.isAdmin; });
+  $('#masterTabLbl').textContent = Auth.isAdmin ? '登録' : 'マスター';
+  $('#masterTitle').textContent = Auth.isAdmin ? '品番とマスター写真' : 'マスター写真（閲覧のみ）';
+}
+let started = false;
+function enterCurrentView() {
+  ({ verify: () => verify.enter(), master: () => master.enter(), history: () => histView.enter(), settings: () => settingsView.enter() })[currentView]();
+}
+function startAfterLogin() {
+  enterCurrentView();
+  Sync.run();
+  if (started) return;
+  started = true;
+  window.addEventListener('online', () => { Sync.render(); Sync.run(); });
+  window.addEventListener('offline', () => Sync.render());
+  setInterval(() => { if (!document.hidden && Date.now() - Sync.last > SYNC_STALE_MS) Sync.run(); }, 60 * 1000);
+}
 
 /* ================= 起動 ================= */
 async function main() {
   await openDB();
   await loadSettings();
+  Sync.last = await kvGet('lastSync', 0);
   $$('#tabs button').forEach(b => b.onclick = () => showView(b.dataset.view));
   verify.init(); master.init(); histView.init(); settingsView.init();
+  applyRoleUI();
 
   document.addEventListener('visibilitychange', () => {
+    if (!Auth.role) return;
+    if (!document.hidden && Date.now() - Sync.last > SYNC_STALE_MS) Sync.run();
     if (currentView !== 'verify') return;
     if (document.hidden) { verify.cam.stop(); keepAwake(false); }
     else { keepAwake(true); if (verify.state === 'live') verify.startCamera(); }
@@ -695,13 +963,15 @@ async function main() {
   if (navigator.storage && navigator.storage.persist) navigator.storage.persist().catch(() => {});
   if ('serviceWorker' in navigator) navigator.serviceWorker.register('sw.js').catch(e => console.warn('SW登録失敗', e));
 
-  verify.enter();
-
   const bar = $('#modelBar');
   loadModel().then(() => { bar.classList.add('ready'); }).catch(e => {
     console.error(e); bar.classList.add('error');
     bar.textContent = 'AIモデルを読み込めませんでした。ページを再読み込みしてください';
   });
+
+  if (!Cloud.configured()) { Gate.config(); return; }
+  Cloud.init();
+  Cloud.onAuth(u => Auth.onUser(u));
 }
 window.__gohin = { embed, similarity, squareFrom, loadModel };   // 動作確認用
 main();

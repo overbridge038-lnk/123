@@ -9,6 +9,7 @@
   --ng: #d32f2f;
   --tabh: 76px;
 }
+[hidden] { display: none !important; }
 * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
 html, body { margin: 0; height: 100%; }
 body {
@@ -150,3 +151,15 @@ h2 { margin: 0; font-size: 24px; }
   #view-verify .action-row { grid-column: 2; grid-row: 3; align-self: end; }
   #view-verify .result-main { font-size: min(30vh, 170px); }
 }
+
+/* ---- クラウド：同期表示・ログイン画面 ---- */
+.sync-line { margin-top: 6px; font-size: 15px; color: var(--sub); min-height: 22px; }
+.sync-line.warn { color: #b26a00; font-weight: 700; }
+.sync-line.err { color: var(--ng); font-weight: 700; }
+.gate { position: fixed; inset: 0; z-index: 40; background: var(--primary); display: flex; align-items: center; justify-content: center; padding: 16px; overflow-y: auto; }
+.gate-box { background: #fff; border-radius: 20px; padding: 24px; width: min(560px, 100%); user-select: text; -webkit-user-select: text; }
+.gate-box h1 { margin: 0 0 4px; font-size: 30px; }
+.gate-box .input { margin-bottom: 12px; }
+.gate-box .btn { width: 100%; margin-top: 8px; }
+.gate-err { color: var(--ng); font-weight: 700; min-height: 28px; margin: 4px 0; }
+.uid-box { word-break: break-all; background: #eef1f5; border-radius: 10px; padding: 12px; font-family: monospace; font-size: 18px; user-select: all; -webkit-user-select: all; }
