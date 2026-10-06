@@ -1,0 +1,174 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#0d47a1">
+<meta name="mobile-web-app-capable" content="yes">
+<link rel="manifest" href="manifest.json">
+<link rel="icon" href="icons/icon-192.png">
+<link rel="apple-touch-icon" href="icons/icon-192.png">
+<link rel="stylesheet" href="style.css">
+<title>誤品照合</title>
+</head>
+<body>
+
+<div id="modelBar" class="model-bar">AIモデルを読み込み中…（初回のみ少し時間がかかります）</div>
+
+<main id="views">
+
+  <!-- ============ 照合 ============ -->
+  <section id="view-verify" class="view active">
+    <button id="partBtn" class="part-btn" type="button">
+      <span class="part-label">品番</span>
+      <span id="partBtnText" class="part-text">タップして品番を選ぶ</span>
+      <span class="part-arrow">▼</span>
+    </button>
+
+    <div class="panes">
+      <div class="pane">
+        <div class="pane-title">マスター（正しい品物）</div>
+        <div class="square"><img id="masterImg" alt="マスター写真"><div id="masterEmpty" class="empty">品番を選んでください</div></div>
+        <div id="masterThumbs" class="thumbs"></div>
+      </div>
+      <div class="pane">
+        <div class="pane-title">現品（いま撮影する品物）</div>
+        <div class="square" id="camBox">
+          <video id="video" playsinline muted autoplay></video>
+          <img id="shotImg" alt="撮影した現品" hidden>
+          <div id="camMsg" class="empty" hidden></div>
+        </div>
+        <div class="thumbs"><span class="hint">四角の中央が照合の範囲です</span></div>
+      </div>
+    </div>
+
+    <div id="result" class="result idle">
+      <div id="resultMain" class="result-main">待機中</div>
+      <div id="resultSub" class="result-sub">品番を選んで「撮影して照合」を押してください</div>
+    </div>
+
+    <div class="action-row">
+      <button id="shootBtn" class="btn big primary" type="button" disabled>撮影して照合</button>
+      <button id="fileShootBtn" class="btn big" type="button" hidden>カメラアプリで撮影</button>
+    </div>
+    <input id="shootFile" type="file" accept="image/*" capture="environment" hidden>
+  </section>
+
+  <!-- ============ 登録 ============ -->
+  <section id="view-master" class="view">
+    <div id="masterList">
+      <div class="bar">
+        <h2>品番とマスター写真</h2>
+        <button id="addPartBtn" class="btn primary" type="button">＋ 品番を追加</button>
+      </div>
+      <input id="partSearch" class="input" type="search" placeholder="品番・品名で検索">
+      <div id="partCards" class="cards"></div>
+    </div>
+
+    <div id="partEdit" hidden>
+      <div class="bar">
+        <button id="editBackBtn" class="btn" type="button">← 戻る</button>
+        <h2 id="editTitle"></h2>
+      </div>
+      <div class="card-block">
+        <label class="field-label">品名</label>
+        <div class="row">
+          <input id="editName" class="input" type="text" placeholder="品名（省略可）">
+          <button id="saveNameBtn" class="btn" type="button">保存</button>
+        </div>
+      </div>
+      <div class="card-block">
+        <label class="field-label">OK / NG のしきい値（類似度 %）</label>
+        <div class="stepper">
+          <button id="thMinus" class="btn step" type="button">−</button>
+          <div id="thValue" class="step-val">70%</div>
+          <button id="thPlus" class="btn step" type="button">＋</button>
+          <button id="thReset" class="btn" type="button">標準に戻す</button>
+        </div>
+        <p class="hint">類似度がこの値以上なら OK、未満なら NG。誤判定が出たら履歴の類似度を見て調整します。</p>
+      </div>
+      <div class="card-block">
+        <label class="field-label">マスター写真（角度違いを数枚登録すると安定します）</label>
+        <div class="row wrap">
+          <button id="camAddBtn" class="btn primary" type="button">カメラで撮影して追加</button>
+          <button id="fileAddBtn" class="btn" type="button">写真ファイルから追加</button>
+        </div>
+        <input id="addFile" type="file" accept="image/*" multiple hidden>
+        <div id="editMasters" class="master-grid"></div>
+      </div>
+      <div class="card-block">
+        <button id="delPartBtn" class="btn danger" type="button">この品番を削除</button>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============ 履歴 ============ -->
+  <section id="view-history" class="view">
+    <div class="bar">
+      <h2>照合履歴</h2>
+      <div class="row">
+        <button id="csvBtn" class="btn primary" type="button">CSVで書き出し</button>
+        <button id="clearHistBtn" class="btn danger" type="button">全削除</button>
+      </div>
+    </div>
+    <div class="row wrap">
+      <input id="histSearch" class="input grow" type="search" placeholder="品番で絞り込み">
+      <div class="seg" id="histResult">
+        <button type="button" data-v="" class="on">全て</button>
+        <button type="button" data-v="OK">OK</button>
+        <button type="button" data-v="NG">NG</button>
+      </div>
+    </div>
+    <div id="histSummary" class="hint"></div>
+    <div id="histList" class="hist-list"></div>
+    <button id="histMore" class="btn" type="button" hidden>もっと見る</button>
+  </section>
+
+  <!-- ============ 設定 ============ -->
+  <section id="view-settings" class="view">
+    <div class="bar"><h2>設定</h2></div>
+    <div class="card-block">
+      <label class="field-label">標準のしきい値（類似度 %）</label>
+      <div class="stepper">
+        <button id="dthMinus" class="btn step" type="button">−</button>
+        <div id="dthValue" class="step-val">70%</div>
+        <button id="dthPlus" class="btn step" type="button">＋</button>
+      </div>
+      <p class="hint">品番ごとにしきい値を決めていない場合に使われます。</p>
+    </div>
+    <div class="card-block">
+      <label class="field-label" for="operator">作業者名（履歴に記録されます）</label>
+      <input id="operator" class="input" type="text" placeholder="例：山田">
+    </div>
+    <div class="card-block">
+      <label class="check"><input id="optSound" type="checkbox"><span>結果をブザー音で知らせる</span></label>
+      <label class="check"><input id="optVibrate" type="checkbox"><span>結果をバイブレーションで知らせる</span></label>
+    </div>
+    <div class="card-block">
+      <label class="field-label">保存状況</label>
+      <div id="storageInfo" class="hint">確認中…</div>
+      <label class="field-label">アプリ情報</label>
+      <div id="appInfo" class="hint"></div>
+    </div>
+    <div class="card-block">
+      <button id="wipeBtn" class="btn danger" type="button">すべてのデータを削除</button>
+      <p class="hint">登録した品番・マスター写真・履歴をすべて消します。元に戻せません。</p>
+    </div>
+  </section>
+
+</main>
+
+<nav id="tabs" class="tabs">
+  <button type="button" data-view="verify" class="on"><span class="ico">✔</span>照合</button>
+  <button type="button" data-view="master"><span class="ico">📷</span>登録</button>
+  <button type="button" data-view="history"><span class="ico">🕘</span>履歴</button>
+  <button type="button" data-view="settings"><span class="ico">⚙</span>設定</button>
+</nav>
+
+<div id="modal" class="modal" hidden></div>
+<div id="toast" class="toast" hidden></div>
+
+<script src="vendor/tf.min.js"></script>
+<script src="app.js"></script>
+</body>
+</html>
