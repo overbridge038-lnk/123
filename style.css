@@ -150,3 +150,18 @@ h2 { margin: 0; font-size: 24px; }
   #view-verify .action-row { grid-column: 2; grid-row: 3; align-self: end; }
   #view-verify .result-main { font-size: min(30vh, 170px); }
 }
+
+/* ---- クラウド同期の表示 / ログイン ---- */
+.sync-bar { position: fixed; top: 6px; right: 8px; z-index: 25; background: rgba(255,255,255,.92); border: 1px solid var(--line); border-radius: 14px; padding: 2px 10px; font-size: 14px; color: var(--sub); max-width: 70vw; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; pointer-events: none; }
+.sync-bar[hidden] { display: none; }
+.sync-bar.ok { color: var(--ok); }
+.sync-bar.error { color: var(--ng); }
+.sync-bar.offline { color: #8a5a00; }
+.tabs button[hidden] { display: none; }
+.login { position: fixed; inset: 0; z-index: 60; background: var(--bg); display: flex; align-items: center; justify-content: center; padding: 16px; overflow-y: auto; }
+.login[hidden] { display: none; }
+.login-box { background: #fff; border-radius: 18px; padding: 24px; width: min(520px, 100%); }
+.login-box h1 { margin: 0 0 16px; font-size: 28px; color: var(--primary); text-align: center; }
+.login-error { margin-top: 12px; color: var(--ng); font-weight: 700; }
+.login-error[hidden], .login-notice[hidden] { display: none; }
+.login-notice { background: #fff3cd; border-radius: 12px; padding: 12px; margin-bottom: 14px; font-weight: 700; }
