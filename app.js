@@ -563,7 +563,7 @@ const master = {
           $('#cClose', d).onclick = () => { URL.revokeObjectURL(img.src); img.hidden = true; $('video', d).hidden = false; mode = 'live'; shoot.textContent = '撮影'; $('#cClose', d).textContent = '閉じる'; $('#cClose', d).onclick = finish; };
         } else {
           shoot.disabled = true; shoot.textContent = '登録中…';
-          try { await addMasterFromCanvas(partNo, shot); added++; toast('登録しました（' + added + '枚）'); }
+          try { await addMasterFromCanvas(partNo, shot); added++; toast('登録しました（' + added + '枚）'); this.renderMasters(); }
           catch (e) { toast('登録に失敗：' + e.message, 4000); }
           URL.revokeObjectURL(img.src); img.hidden = true; $('video', d).hidden = false;
           mode = 'live'; shoot.disabled = false; shoot.textContent = '続けて撮影'; $('#cClose', d).textContent = '終了';
