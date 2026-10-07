@@ -2,11 +2,12 @@
 /* 誤品照合アプリ
  * - 写真の特徴量を MobileNetV2（同梱モデル）で数値化し、コサイン類似度で OK / NG を判定（処理は端末内）
  * - マスター（品番・写真）は Firebase（Firestore）で全員が共有し、各端末の IndexedDB にキャッシュ（cloud.js）
+ * - 照合キー方式（keys.js / keyui.js）：管理者がマスター写真の上で設定した形状・有無・刻印のキーで判定する（白背景の影絵＋位置合わせ）
  * - 照合履歴はこの端末の IndexedDB にだけ保存します。
  */
 
 /* ================= 設定値 ================= */
-const APP_VERSION = '2.2.0';
+const APP_VERSION = '3.0.0';
 const MODEL_URL = 'model/model.json';
 const FEATURE_NODE = 'module_apply_default/MobilenetV2/Conv_1/Relu6'; // 7x7x1280 の特徴マップ
 const MODEL_VER = 'mnv2-1';       // モデルや計算方法を変えたら必ず変更（登録済み写真の特徴量を再計算するため）
@@ -22,6 +23,7 @@ const ALIGN_MIN = 0.3;            // 位置合わせの良さ(0〜1)がこれ未
 const POINT_COVER_MIN = 0.6;      // ポイントの四角のうち、現品の写真に入っている割合の下限
 const UNK = '判定不能';            // 判定の結果：OK / NG / 判定不能（計算できなかった・条件が不適切。OK は絶対に出さない）
 const MAX_ALIGN = 8;              // 位置合わせを試すマスター写真の最大数（時間がかかりすぎないように）
+const MAX_KEY_MASTERS = 4;        // 照合キー方式で、位置合わせを試すマスター写真の最大数
 
 const $ = (s, r = document) => r.querySelector(s);
 const $$ = (s, r = document) => [...r.querySelectorAll(s)];
@@ -94,9 +96,15 @@ function esc(s) { return String(s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<'
 /** 汎用ダイアログ。build(dialogElement, close) で中身を作る */
 function openDialog(build) {
   return new Promise(resolve => {
-    const m = $('#modal'); m.innerHTML = ''; m.hidden = false;
+    const m = $('#modal'); m.hidden = false;
+    [...m.children].forEach(c => { c.hidden = true; });          // 開いているダイアログは隠すだけ（閉じたら元に戻る）
     const d = document.createElement('div'); d.className = 'dialog'; m.appendChild(d);
-    const close = v => { m.hidden = true; m.innerHTML = ''; resolve(v); };
+    const close = v => {
+      d.remove();
+      const rest = [...m.children];
+      if (rest.length) rest[rest.length - 1].hidden = false; else { m.hidden = true; m.innerHTML = ''; }
+      resolve(v);
+    };
     build(d, close);
   });
 }
@@ -345,8 +353,8 @@ const pointsOf = (part, photoId) => cleanPoints(part && part.points && part.poin
 const pointTh = p => typeof p.th === 'number' ? p.th : settings.pointThreshold;
 
 /** canvas → 形状照合用の白黒画像（384px四方） */
-function grayFromCanvas(canvas) {
-  const n = Shape.WORK, c = document.createElement('canvas'); c.width = c.height = n;
+function grayFromCanvas(canvas, n = Shape.WORK) {
+  const c = document.createElement('canvas'); c.width = c.height = n;
   const ctx = c.getContext('2d', { willReadFrequently: true });
   ctx.imageSmoothingQuality = 'high'; ctx.drawImage(canvas, 0, 0, n, n);
   const px = ctx.getImageData(0, 0, n, n).data, d = new Float32Array(n * n);
@@ -365,12 +373,54 @@ async function masterShape(m) {
   return prep;
 }
 
-/** 写真(canvas)を圧縮してクラウドに登録する（管理者のみ） */
-async function addMasterFromCanvas(partNo, canvas) {
+/* ---- 照合キー ----
+ * 品番データの keySets = { マスター写真ID: [ { id, name, type, x, y, w, h, must, th?, exp? } ] }（type: shape | presence | engrave）
+ * samples = { 写真ID: { kind: 'good'|'bad', type?, memo? } }（載っていない写真は「マスター」）。座標は 0〜1 の比率 */
+const kindOf = (part, id) => (part && part.samples && part.samples[id] && part.samples[id].kind) || 'master';
+function cleanKeys(list) {
+  const out = [];
+  for (const p of (Array.isArray(list) ? list : [])) {
+    if (!p || out.length >= KEYS_PER_PART || !KEY_TYPES[p.type]) continue;
+    const x = clamp01(p.x), y = clamp01(p.y), w = Math.min(clamp01(p.w), 1 - x), h = Math.min(clamp01(p.h), 1 - y);
+    if (w < 0.01 || h < 0.01) continue;
+    const q = { id: String(p.id || newKeyId()).slice(0, 20), name: String(p.name || '').slice(0, 30) || KEY_TYPES[p.type] + (out.length + 1), type: p.type, x, y, w, h, must: p.must !== false };
+    if (typeof p.th === 'number' && p.th >= 1 && p.th <= 99) q.th = Math.round(p.th);
+    if (p.type === 'presence') q.exp = { present: !(p.exp && p.exp.present === false) };
+    out.push(q);
+  }
+  return out;
+}
+const keysOf = (part, photoId) => cleanKeys(part && part.keySets && part.keySets[photoId]);
+const keyCountOf = part => Object.values((part && part.keySets) || {}).reduce((a, v) => a + (Array.isArray(v) ? v.length : 0), 0);
+const keyPrepCache = new Map();    // マスター写真ID → { size, prep, an }（影絵・位置合わせ用データ。計算し直しを避ける）
+async function masterKeyPrep(m) {
+  const hit = keyPrepCache.get(m.id);
+  if (hit && hit.size === m.blob.size) return hit;
+  const gray = grayFromCanvas(await canvasFromFile(m.blob, MASTER_SIZE), Keys.WORK);
+  const an = Keys.analyze(gray);
+  const rec = { size: m.blob.size, prep: Keys.prepare(gray, an), an };
+  keyPrepCache.set(m.id, rec);
+  return rec;
+}
+/** キーを登録したマスター写真を、Keys.evaluate に渡す形にする（位置合わせを試すのは最大 MAX_KEY_MASTERS 枚） */
+async function keyMasterList(part, masters) {
+  const list = [];
+  for (const m of masters) {
+    const keys = keysOf(part, m.id);
+    if (!keys.length) continue;
+    const rec = await masterKeyPrep(m);
+    list.push({ id: m.id, prep: rec.prep, an: rec.an, keys });
+    if (list.length >= MAX_KEY_MASTERS) break;
+  }
+  return list;
+}
+
+/** 写真(canvas)を圧縮してクラウドに登録する（管理者のみ）。meta = { kind: 'good'|'bad', type, memo }（省略するとマスター写真） */
+async function addMasterFromCanvas(partNo, canvas, meta) {
   let c;
   try { c = await compressForCloud(canvas); }
   catch (e) { if (e && typeof e === 'object') e.phase = '写真の圧縮'; throw e; }
-  return cloud.addPhoto(partNo, c.blob, c.w, c.h);
+  return cloud.addPhoto(partNo, c.blob, c.w, c.h, meta);
 }
 async function pickPart(currentNo) {
   const parts = (await dbAll('cparts')).sort((a, b) => a.partNo.localeCompare(b.partNo, 'ja', { numeric: true }));
@@ -423,6 +473,11 @@ const verify = {
     $('#partBtn').onclick = () => this.choosePart();
     $('#shootBtn').onclick = () => this.onShoot();
     $('#fileShootBtn').onclick = () => $('#shootFile').click();
+    $('#helpBtn').onclick = () => KeyUI.helpDialog();
+    for (const id of ['#shotOverlay', '#masterOverlay']) $(id).addEventListener('click', e => {
+      const pg = e.target.closest && e.target.closest('polygon');
+      if (pg && pg.dataset.i !== undefined) this.tapKey(+pg.dataset.i);
+    });
     $('#shootFile').onchange = async e => {
       const f = e.target.files[0]; e.target.value = '';
       if (f) await this.judge(await canvasFromFile(f));
@@ -457,7 +512,8 @@ const verify = {
   },
 
   async loadMasters() {
-    this.masters = this.part ? await mastersOf(this.part.partNo) : [];
+    const all = this.part ? await mastersOf(this.part.partNo) : [];
+    this.masters = all.filter(m => kindOf(this.part, m.id) === 'master');      // サンプル写真（正しい品・誤品）は照合には使わない
     this.masters.sort((a, b) => a.createdAt - b.createdAt);
     this.shown = 0;
   },
@@ -495,6 +551,9 @@ const verify = {
       });
     }
     const ready = !!(this.part && this.masters.length);
+    const keyMode = !!(this.part && this.masters.some(m => keysOf(this.part, m.id).length));
+    $('#guide').hidden = !keyMode || this.state === 'result' || this.state === 'busy';
+    $('#camHint').textContent = keyMode ? '白い紙の上に置いて、点線の枠の中に収めてください' : '四角の中央が照合の範囲です';
     $('#shootBtn').disabled = !ready || this.state === 'busy';
     $('#shootBtn').textContent = this.state === 'result' ? '次の照合へ' : '撮影して照合';
     $('#fileShootBtn').hidden = !this.fallback || this.state === 'result';
@@ -551,8 +610,10 @@ const verify = {
     this.setResult('busy', '判定中…', 'AIが写真を比べています');
     let out;
     try {
+      const keyMasters = this.masters.filter(m => keysOf(this.part, m.id).length);
       const ptMasters = this.masters.filter(m => pointsOf(this.part, m.id).length);
-      out = ptMasters.length ? await this.judgePoints(canvas, ptMasters) : await this.judgeGlobal(canvas);
+      out = keyMasters.length ? await this.judgeKeys(canvas, keyMasters)
+        : ptMasters.length ? await this.judgePoints(canvas, ptMasters) : await this.judgeGlobal(canvas);
       if (!out || (out.result !== 'OK' && out.result !== 'NG' && out.result !== UNK)) throw new Error('判定結果が不正です');
     } catch (e) {
       console.error(e);
@@ -574,17 +635,22 @@ const verify = {
     const kind = out.result === 'OK' ? 'ok' : out.result === 'NG' ? 'ng' : 'unk';
     const mid = out.masterId || (this.masters[0] && this.masters[0].id);
     if (out.masterId) { this.bestId = out.masterId; this.shown = Math.max(0, this.masters.findIndex(m => m.id === out.masterId)); }
-    this.overlay = out.items && out.masterId ? { masterId: out.masterId, items: out.items } : null;
+    this.overlay = out.items && out.items.length && out.masterId ? { masterId: out.masterId, items: out.items } : null;
+    this.tapped = -1;
     let sub = out.result === UNK ? '撮り直してください：' + out.reason : out.sub;
     let saveFailed = null;
     try {
       await this.saveHistory(canvas, {
         result: out.result, score: out.score || 0, threshold: out.threshold || 0, masterId: mid, mode: out.mode || 'global',
-        reason: out.reason || '', points: out.points, global: out.global, note: out.note
+        reason: out.reason || '', points: out.points, global: out.global, note: out.note,
+        keys: out.mode === 'keys' ? (out.items || []).map(i => ({ name: i.name, type: i.type, must: i.must, state: i.state, score: i.score, th: i.th, exp: i.exp, obs: i.obs, why: i.why })) : undefined,
+        align: out.mode === 'keys' ? out.align : undefined,
+        quality: out.mode === 'keys' && out.quality ? Object.assign({}, out.quality, { issues: (out.issues || []).map(i => i.msg) }) : undefined
       });
     } catch (e) { console.error(e); saveFailed = e; sub += '（履歴に保存できませんでした）'; }
     this.setResult(kind, out.result, sub);
-    this.showPointList(out.items || null);
+    this.showPointList(out.items && out.items.length ? out.items : null);
+    KeyUI.renderReport($('#keyReport'), out);
     this.showResultError(out.error ? out.error : saveFailed, out.error ? '判定' : '履歴の保存');
     notifyResult(out.result);
   },
@@ -593,6 +659,33 @@ const verify = {
     const box = $('#resultErr');
     if (!e) { box.hidden = true; box.innerHTML = ''; return; }
     fillErrorBox(box, '判定でエラーが発生しました', `${this.part ? '品番: ' + this.part.partNo : ''}`, describeError(e, context));
+  },
+
+  /** 照合キー方式：撮影の品質チェック → 位置合わせ → キーごとの判定（keys.js）。OK は、すべて正常で必須キーが全部 OK のときだけ */
+  async judgeKeys(canvas, keyMasters) {
+    this.setResult('busy', '判定中…', '撮影の状態と位置を確認しています');
+    await sleep(30);                                       // 画面の更新を先に済ませる
+    let list;
+    try { list = await keyMasterList(this.part, keyMasters); }
+    catch (e) { throw new Unjudgeable('マスター写真のデータが不足・破損しています（' + ((e && e.message) || e) + '）', { masterId: keyMasters[0].id, mode: 'keys' }); }
+    const r = Keys.evaluate(list, grayFromCanvas(canvas, Keys.WORK));
+    const result = r.result === 'UNK' ? UNK : r.result;
+    const items = r.items || [], okN = items.filter(i => i.state === 'ok').length;
+    let sub = `キー ${okN}/${items.length} OK`;
+    const ngMust = items.filter(i => i.must && i.state === 'ng').map(i => i.name), refNg = items.filter(i => !i.must && i.state === 'ng').map(i => i.name);
+    if (ngMust.length) sub += '　NG：' + ngMust.join('、');
+    else if (result === 'OK' && refNg.length) sub += `（参考NG：${refNg.join('、')}）`;
+    return {
+      result, mode: 'keys', reason: r.reason, sub, items, quality: r.quality, issues: r.issues,
+      masterId: r.masterId || list[0].id, align: r.masterId ? r.conf * 100 : null,
+      score: items.length ? Math.min(...items.map(i => i.score)) : 0, threshold: 0, error: r.error
+    };
+  },
+
+  /** 結果画面で、現品写真の枠をタップしたとき：そのキーの名前と測定値を出す */
+  tapKey(i) {
+    const items = this.overlay && this.overlay.items; if (!items || !items[i]) return;
+    this.tapped = i; this.renderOverlay(); KeyUI.tapInfo(items[i]);
   },
 
   /** 従来の方式：写真全体の見た目の類似度（検査ポイントを設定していない品番だけ） */
@@ -696,17 +789,20 @@ const verify = {
   showPointList(items) {
     const box = $('#pointList');
     box.hidden = !items;
-    box.innerHTML = items ? items.map((it, i) =>
-      `<span class="pchip ${it.ok ? 'ok' : 'ng'}${it.must ? '' : ' ref'}">${i + 1}.${esc(it.name)} ${it.out ? '範囲外' : it.score.toFixed(0) + '%'}${it.must ? '' : '（参考）'}</span>`).join('') : '';
+    box.innerHTML = items ? items.map((it, i) => {
+      const st = it.state || (it.ok ? 'ok' : 'ng');
+      const val = it.out ? '範囲外' : st === 'unk' ? '判定不能' : it.score.toFixed(0) + '%';
+      return `<span class="pchip ${st}${it.must ? '' : ' ref'}">${i + 1}.${esc(it.name)} ${val}${it.must ? '' : '（参考）'}</span>`;
+    }).join('') : '';
   },
 
   /** 現品写真（と、あればマスター写真）に、OK=緑・NG=赤の枠を重ねる */
   renderOverlay() {
     const shot = $('#shotOverlay'), mst = $('#masterOverlay'), o = this.overlay;
-    const cls = it => it.ok ? 'okc' : 'ngc';
+    const cls = it => { const st = it.state || (it.ok ? 'ok' : 'ng'); return st === 'ok' ? 'okc' : st === 'ng' ? 'ngc' : 'unkc'; };
     const mark = (it, i, pts) => {
       const dash = it.must ? '' : ' stroke-dasharray="9 6"';
-      return `<polygon class="${cls(it)}" points="${pts.map(q => q.map(v => v.toFixed(4)).join(',')).join(' ')}"${dash}/>` +
+      return `<polygon data-i="${i}" class="${cls(it)}${i === this.tapped ? ' sel' : ''}" points="${pts.map(q => q.map(v => v.toFixed(4)).join(',')).join(' ')}"${dash}/>` +
         `<text class="${cls(it)}" x="${(pts[0][0] + 0.005).toFixed(4)}" y="${(pts[0][1] - 0.008).toFixed(4)}">${i + 1}</text>`;
     };
     const show = !!o && this.state === 'result' && !$('#shotImg').hidden;
@@ -741,11 +837,22 @@ const master = {
     $('#camAddBtn').onclick = () => this.addByCamera();
     $('#fileAddBtn').onclick = () => $('#addFile').click();
     $('#addFile').onchange = e => this.addByFiles([...e.target.files]).then(() => { e.target.value = ''; });
+    // サンプル写真（正しい品・誤品）：先に区分を選んでから、撮影・選択する
+    $('#sampleCamBtn').onclick = async () => { const meta = await KeyUI.sampleMetaDialog('これから撮る写真は？', { kind: 'good' }); if (meta) await this.addByCamera(this.metaOf(meta)); };
+    $('#sampleFileBtn').onclick = async () => { const meta = await KeyUI.sampleMetaDialog('選ぶ写真は？', { kind: 'good' }); if (!meta) return; this.pendingMeta = this.metaOf(meta) || null; this.pendingFile = true; $('#sampleFile').click(); };
+    $('#sampleFile').onchange = async e => {
+      const files = [...e.target.files]; e.target.value = '';
+      if (files.length && this.pendingFile) await this.addByFiles(files, this.pendingMeta);
+      this.pendingFile = false;
+    };
+    $('#accuracyBtn').onclick = () => KeyUI.accuracy(this.editing.partNo);
     $('#delPartBtn').onclick = async () => {
       if (!await ask(`品番「${this.editing.partNo}」とマスター写真を削除します。全員のタブレットから消えます。よろしいですか？`, '削除する', true)) return;
       await this.run(async () => { await cloud.deletePart(this.editing.partNo); this.closeEdit(); toast('削除しました'); });
     };
   },
+  /** 区分ダイアログの結果 → クラウドに保存する形（マスターなら undefined） */
+  metaOf(m) { return m && m.kind !== 'master' ? { kind: m.kind, type: m.type, memo: m.memo } : undefined; },
   /** クラウドへの書き込みをまとめて実行し、失敗したら理由を表示する */
   async run(fn) {
     try { await fn(); }
@@ -765,11 +872,12 @@ const master = {
     const hit = parts.filter(p => !q || p.partNo.toLowerCase().includes(q) || (p.name || '').toLowerCase().includes(q));
     if (!hit.length) cards.innerHTML = `<div class="hint">${parts.length ? '該当なし' : '品番がまだありません。「＋ 品番を追加」を押してください。'}</div>`;
     hit.forEach(p => {
-      const ms = masters.filter(m => m.partNo === p.partNo).sort((a, b) => a.createdAt - b.createdAt);
+      const ms = masters.filter(m => m.partNo === p.partNo && kindOf(p, m.id) === 'master').sort((a, b) => a.createdAt - b.createdAt);
+      const nk = keyCountOf(p);
       const b = document.createElement('button'); b.className = 'pcard';
       b.innerHTML = (ms.length ? `<img src="${mkUrl('plist', ms[0].blob)}" alt="">` : '<div class="noimg"></div>') +
         `<div><div class="t">${esc(p.partNo)}</div><div class="s">${esc(p.name || '（品名なし）')}</div>` +
-        `<div class="s ${ms.length ? '' : 'warn'}">${ms.length ? 'マスター ' + ms.length + '枚' : 'マスター未登録'}</div></div>`;
+        `<div class="s ${ms.length ? '' : 'warn'}">${ms.length ? 'マスター ' + ms.length + '枚' : 'マスター未登録'}${nk ? '／照合キー ' + nk + '個' : ''}</div></div>`;
       b.onclick = () => this.openEdit(p.partNo);
       cards.appendChild(b);
     });
@@ -820,19 +928,42 @@ const master = {
 
   async renderMasters() {
     clearUrls('medit');
-    const ms = (await mastersOf(this.editing.partNo)).sort((a, b) => a.createdAt - b.createdAt);
+    const p = this.editing, all = (await mastersOf(p.partNo)).sort((a, b) => a.createdAt - b.createdAt);
+    const ms = all.filter(m => kindOf(p, m.id) === 'master'), ss = all.filter(m => kindOf(p, m.id) !== 'master');
     const g = $('#editMasters'); g.innerHTML = ms.length ? '' : '<div class="hint">マスター写真がまだありません</div>';
     ms.forEach(m => {
       const c = document.createElement('div'); c.className = 'mcell';
-      const np = pointsOf(this.editing, m.id).length;
-      c.innerHTML = `<img src="${mkUrl('medit', m.blob)}" alt=""><button type="button" aria-label="削除">×</button><button type="button" class="pt">◎ 検査ポイント ${np}</button>`;
-      c.querySelector('button.pt').onclick = () => this.editPoints(m);
-      c.querySelector('button').onclick = async () => {
+      const np = pointsOf(p, m.id).length, nk = keysOf(p, m.id).length;
+      c.innerHTML = `<img src="${mkUrl('medit', m.blob)}" alt=""><button type="button" class="del" aria-label="削除">×</button>` +
+        (np ? `<button type="button" class="pt old">旧・検査ポイント ${np}</button>` : '') +
+        `<button type="button" class="pt key">◎ 照合キー ${nk}個</button>`;
+      c.querySelector('button.key').onclick = () => KeyUI.editKeys(m);
+      if (np) c.querySelector('button.old').onclick = () => this.editPoints(m);
+      c.querySelector('button.del').onclick = async () => {
         if (!await ask('このマスター写真を削除しますか？', '削除する', true)) return;
-        await this.run(async () => { await cloud.deletePhoto(this.editing.partNo, m.id); await this.renderMasters(); });
+        await this.run(async () => { await cloud.deletePhoto(p.partNo, m.id); await this.renderMasters(); });
       };
       g.appendChild(c);
     });
+    // サンプル写真（正しい品・誤品）
+    const sg = $('#editSamples'); sg.innerHTML = ss.length ? '' : '<div class="hint">サンプル写真がまだありません</div>';
+    ss.forEach(m => {
+      const meta = p.samples[m.id], c = document.createElement('button');
+      c.type = 'button'; c.className = 'mcell'; c.style.border = '0'; c.style.padding = '0';
+      c.innerHTML = `<img src="${mkUrl('medit', m.blob)}" alt=""><span class="tag ${meta.kind}">${meta.kind === 'good' ? '正しい品' : '誤品：' + esc(meta.type || 'その他')}</span>` + (meta.memo ? `<div class="sub">${esc(meta.memo)}</div>` : '');
+      c.onclick = async () => {
+        const r = await KeyUI.sampleMetaDialog('サンプル写真の編集', Object.assign({ kind: meta.kind }, meta), true);
+        if (!r) return;
+        if (r.del) {
+          if (!await ask('このサンプル写真を削除しますか？', '削除する', true)) return;
+          await this.run(async () => { await cloud.deletePhoto(p.partNo, m.id); await this.renderMasters(); });
+        } else await this.run(async () => { await cloud.setSample(p.partNo, m.id, this.metaOf(r) || null); await this.renderMasters(); });
+      };
+      sg.appendChild(c);
+    });
+    const bytes = all.reduce((a, m) => a + (m.blob ? m.blob.size : 0), 0), nk = keyCountOf(p);
+    const good = ss.filter(m => p.samples[m.id].kind === 'good').length;
+    $('#capInfo').textContent = `写真 ${all.length}/${PHOTOS_PER_PART}枚（マスター ${ms.length}・正しい品 ${good}・誤品 ${ss.length - good}）／写真データ 約${(bytes / 1048576).toFixed(1)}MB（1枚400KB以下、上限${PHOTOS_PER_PART}枚で最大約${Math.round(PHOTOS_PER_PART * 0.4)}MB）／照合キー ${nk}/${KEYS_PER_PART}個`;
   },
 
   /** 検査ポイントの登録画面：マスター写真の上を指でなぞって四角を作る。移動・拡大縮小・削除ができる */
@@ -968,7 +1099,7 @@ const master = {
   },
 
   /** 複数の写真を1枚ずつ登録する。失敗した写真があっても残りは続け、最後にどれが失敗したか表示する */
-  async addByFiles(files) {
+  async addByFiles(files, meta) {
     if (!files.length) return;
     const partNo = this.editing.partNo;
     const have = ((await dbGet('cparts', partNo)) || {}).photoIds || [];
@@ -979,7 +1110,7 @@ const master = {
     let ok = 0; const failed = [];
     for (let i = 0; i < files.length; i++) {
       toast(`登録中… ${i + 1}/${files.length}枚目`, 60000);
-      try { await addMasterFromCanvas(partNo, await canvasFromFile(files[i], PHOTO_MAX_SIDE)); ok++; this.renderMasters(); }
+      try { await addMasterFromCanvas(partNo, await canvasFromFile(files[i], PHOTO_MAX_SIDE), meta); ok++; this.renderMasters(); }
       catch (e) {
         console.error(e);
         failed.push({ no: i + 1, name: files[i].name || '', e });
@@ -993,18 +1124,20 @@ const master = {
     await showErrorReport('登録できなかった写真があります', `成功 ${ok}枚／失敗 ${failed.length}枚（失敗: ${failed.map(f => f.no + '枚目').join('、') || 'なし'}）。品番: ${partNo}`, detail);
   },
 
-  async addByCamera() {
+  async addByCamera(meta) {
     const partNo = this.editing.partNo;
+    const label = !meta ? 'マスター写真' : meta.kind === 'good' ? '正しい品のサンプル' : '誤品のサンプル（' + (meta.type || 'その他') + '）';
     let added = 0;
     await openDialog((d, close) => {
-      d.innerHTML = `<h3>マスター写真を撮影（${esc(partNo)}）</h3>
-        <div class="square"><video playsinline muted autoplay></video><img hidden alt=""><div class="empty" hidden></div></div>
-        <div class="hint" id="camHelp">四角の中央が登録される範囲です。現品を真ん中に置いてください。</div>
+      d.innerHTML = `<h3>${esc(label)}を撮影（${esc(partNo)}）</h3>
+        <div class="square"><video playsinline muted autoplay></video><img hidden alt=""><div class="guide"></div><div class="empty" hidden></div></div>
+        <div class="hint" id="camHelp">白い紙の上に置いて、点線の枠の中に収めてください（正方形の中央が登録されます）。<button class="btn small" id="cHelp" type="button">撮影のコツ</button></div>
         <div class="errwrap" id="camErr" hidden></div>
         <div class="row"><button class="btn" id="cClose">閉じる</button><button class="btn primary" id="cShoot">撮影</button></div>`;
       const cam = new Camera($('video', d)), img = $('img', d), msg = $('.empty', d), shoot = $('#cShoot', d);
       let mode = 'live', shot = null;
       const finish = () => { cam.stop(); close(); };
+      $('#cHelp', d).onclick = () => KeyUI.helpDialog();
       $('#cClose', d).onclick = finish;
       cam.start().catch(e => { msg.hidden = false; msg.textContent = cameraErrorText(e); shoot.disabled = true; });
       shoot.onclick = async () => {
@@ -1016,7 +1149,7 @@ const master = {
           $('#cClose', d).onclick = () => { URL.revokeObjectURL(img.src); img.hidden = true; $('video', d).hidden = false; mode = 'live'; shoot.textContent = '撮影'; $('#cClose', d).textContent = '閉じる'; $('#cClose', d).onclick = finish; };
         } else {
           shoot.disabled = true; shoot.textContent = '登録中…'; $('#camErr', d).hidden = true;
-          try { await addMasterFromCanvas(partNo, shot); added++; toast('登録しました（' + added + '枚）'); this.renderMasters(); }
+          try { await addMasterFromCanvas(partNo, shot, meta); added++; toast('登録しました（' + added + '枚）'); this.renderMasters(); }
           catch (e) {
             console.error(e); toast('登録に失敗しました', 3000);
             fillErrorBox($('#camErr', d), '写真を登録できませんでした', `品番: ${partNo}`, describeError(e, 'マスター写真の登録（カメラ）'));
@@ -1078,6 +1211,7 @@ const histView = {
       d.innerHTML = `<h3>${esc(r.partNo)}　<span class="badge ${badgeClass(r.result)}">${r.result}</span></h3>` +
         (r.photo ? `<img class="photo" src="${mkUrl('histd', r.photo)}" alt="">` : '') +
         `<p>${fmtDate(r.ts)}<br>${histScore(r)}${r.operator ? '<br>作業者：' + esc(r.operator) : ''}</p>` +
+        (r.mode === 'keys' ? histKeysHtml(r) : '') +
         (r.mode === 'points' && r.points ? '<p>' + r.points.map((p, i) => `${p.ok ? '✅' : '❌'} ${i + 1}.${esc(p.name)} ${p.out ? '範囲外' : p.score.toFixed(0) + '%'}（基準 ${p.th}%）${p.must ? '' : '（参考）'}`).join('<br>') + '</p>' : '') +
         `<div class="row"><button class="btn danger" id="hDel">この履歴を削除</button><button class="btn primary" id="hClose">閉じる</button></div>`;
       $('#hClose', d).onclick = () => close();
@@ -1087,15 +1221,19 @@ const histView = {
   exportCsv() {
     if (!this.filtered.length) { toast('書き出す履歴がありません'); return; }
     const q = s => '"' + String(s).replace(/"/g, '""') + '"';
-    const head = ['日時', '品番', '品名', '結果', '類似度(%)', 'しきい値(%)', '作業者', '方式', 'NGポイント', '判定不能の理由', '各ポイントの測定値'];
+    const head = ['日時', '品番', '品名', '結果', '類似度(%)', 'しきい値(%)', '作業者', '方式', 'NGポイント', '判定不能の理由', '各ポイントの測定値', 'NGキー', 'キーごとの測定値', '位置合わせの信頼度(%)', '撮影の品質チェック'];
     const lines = [head.map(q).join(',')];
     [...this.filtered].reverse().forEach(r => {
-      const pts = r.mode === 'points';
+      const pts = r.mode === 'points', ky = r.mode === 'keys';
+      const ngKeys = (r.keys || []).filter(k => k.state === 'ng').map(k => k.name + (k.must ? '' : '(参考)')).join(' / ');
+      const keyVals = (r.keys || []).map(k => k.why ? `${k.name}:${k.why}` : k.type === 'presence' ? `${k.name}:マスター${k.exp}/現品${k.obs}(${k.score}%,基準${k.th}%${k.must ? '' : ',参考'})` : `${k.name}:${k.score}%(基準${k.th}%${k.must ? '' : ',参考'})${k.state === 'unk' ? '[判定不能]' : ''}`).join(' / ');
+      const qc = r.quality ? `背景${r.quality.bg}/差${r.quality.contrast}/鋭さ${r.quality.sharp}/ばらつき${r.quality.bgStd}` + (r.quality.issues && r.quality.issues.length ? ' 警告:' + r.quality.issues.join(' / ') : ' 問題なし') : '';
       const ngNames = (r.points || []).filter(p => !p.ok && !p.out).map(p => p.name).concat(r.note && r.result !== UNK ? [r.note] : []);
       const measured = (r.points || []).map(p => `${p.name}:${p.out ? '範囲外' : p.score.toFixed(1) + '%'}(基準${p.th}%${p.must ? '' : ',参考'})`).join(' / ');
       lines.push([fmtDate(r.ts), r.partNo, r.partName || '', r.result,
-        pts || r.result === UNK ? '' : r.score.toFixed(1), pts || r.result === UNK ? '' : r.threshold, r.operator || '',
-        pts ? '検査ポイント' : '全体の類似度', ngNames.join(' / '), r.result === UNK ? (r.reason || r.note || '') : '', measured].map(q).join(','));
+        pts || ky || r.result === UNK ? '' : r.score.toFixed(1), pts || ky || r.result === UNK ? '' : r.threshold, r.operator || '',
+        ky ? 'キー照合' : pts ? '検査ポイント' : '全体の類似度', ngNames.join(' / '), r.result === UNK ? (r.reason || r.note || '') : '', measured,
+        ky ? ngKeys : '', ky ? keyVals : '', ky && r.align != null ? r.align.toFixed(1) : '', ky ? qc : ''].map(q).join(','));
     });
     const blob = new Blob(['﻿' + lines.join('\r\n') + '\r\n'], { type: 'text/csv;charset=utf-8' });
     const a = document.createElement('a');
@@ -1108,8 +1246,22 @@ const histView = {
 };
 /** 履歴1件の点数の説明（検査ポイント方式かどうかで変わる） */
 function badgeClass(result) { return result === UNK ? 'UNK' : result; }
+const KEY_ST = { ok: '✅', ng: '❌', unk: '⚠' };
+function histKeysHtml(r) {
+  const q = r.quality;
+  return '<p>' + (r.keys || []).map((k, i) => {
+    const v = k.type === 'presence' && !k.why ? `マスター ${k.exp}／現品 ${k.obs}（信頼度 ${k.score}%）` : k.why ? esc(k.why) : `一致度 ${k.score}%`;
+    return `${KEY_ST[k.state] || ''} ${i + 1}.${esc(k.name)}（${KEY_TYPES[k.type] || ''}）${v}（基準 ${k.th}%）${k.must ? '' : '（参考）'}`;
+  }).join('<br>') + '</p>' +
+    (r.align != null ? `<p>位置合わせの信頼度：${r.align.toFixed(0)}%</p>` : '') +
+    (q ? `<p>撮影の品質：背景 ${q.bg}／差 ${q.contrast}／鋭さ ${q.sharp}／背景のばらつき ${q.bgStd}${q.issues && q.issues.length ? '<br>警告：' + q.issues.map(esc).join(' / ') : '（問題なし）'}</p>` : '');
+}
 function histScore(r) {
   if (r.result === UNK) return esc(r.reason || r.note || '判定できませんでした');
+  if (r.mode === 'keys') {
+    const ks = r.keys || [], ng = ks.filter(k => k.must && k.state === 'ng').map(k => k.name);
+    return `キー ${ks.filter(k => k.state === 'ok').length}/${ks.length} OK` + (ng.length ? '　NG：' + esc(ng.join('、')) : '') + (r.align != null ? `／位置合わせ ${r.align.toFixed(0)}%` : '');
+  }
   if (r.mode !== 'points') return `類似度 ${r.score.toFixed(1)}%（基準 ${r.threshold}%）`;
   if (r.note) return esc(r.note);
   const n = (r.points || []).length, ok = (r.points || []).filter(p => p.ok).length;
