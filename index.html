@@ -38,9 +38,10 @@
           <video id="video" playsinline muted autoplay></video>
           <img id="shotImg" alt="撮影した現品" hidden>
           <svg id="shotOverlay" class="overlay" viewBox="0 0 1 1" preserveAspectRatio="none" hidden></svg>
+          <div id="guide" class="guide" hidden></div>
           <div id="camMsg" class="empty" hidden></div>
         </div>
-        <div class="thumbs"><span class="hint">四角の中央が照合の範囲です</span></div>
+        <div class="thumbs"><span class="hint" id="camHint">白い紙の上に置いて、点線の枠の中に収めてください</span><button id="helpBtn" class="btn small" type="button">撮影のコツ</button></div>
       </div>
     </div>
 
@@ -49,6 +50,7 @@
       <div id="resultSub" class="result-sub">品番を選んで「撮影して照合」を押してください</div>
       <div id="pointList" class="point-list" hidden></div>
     </div>
+    <div id="keyReport" class="report" hidden></div>
     <div id="resultErr" class="errwrap" hidden></div>
 
     <div class="action-row">
@@ -99,6 +101,23 @@
         </div>
         <input id="addFile" type="file" accept="image/*" multiple hidden>
         <div id="editMasters" class="master-grid"></div>
+        <p class="hint">各マスター写真の「◎ 照合キー」ボタンで、形状・有無・刻印のキーを設定します。</p>
+      </div>
+      <div class="card-block">
+        <label class="field-label">サンプル写真（正しい品・誤品）</label>
+        <p class="hint">正しい品を角度・置き方を少し変えて5〜10枚、実際に起きる誤品（欠品・付け間違い・別品番）を数枚、追加してください。「精度の確認」で、キーが誤品を見分けられるか確かめられます。</p>
+        <div class="row wrap">
+          <button id="sampleCamBtn" class="btn primary" type="button">カメラで撮影して追加</button>
+          <button id="sampleFileBtn" class="btn" type="button">写真ファイルから追加</button>
+        </div>
+        <input id="sampleFile" type="file" accept="image/*" multiple hidden>
+        <div id="editSamples" class="master-grid"></div>
+      </div>
+      <div class="card-block">
+        <label class="field-label">精度の確認</label>
+        <p class="hint">登録した正しい品・誤品のサンプル全部を、いまの照合キーで判定します。「誤品をOKにした件数」が0でなければ不合格です。</p>
+        <button id="accuracyBtn" class="btn primary" type="button">精度を確認する</button>
+        <div id="capInfo" class="hint"></div>
       </div>
       <div class="card-block">
         <button id="delPartBtn" class="btn danger" type="button">この品番を削除</button>
@@ -220,6 +239,8 @@
 <script src="firebase-config.js"></script>
 <script src="cloud.js"></script>
 <script src="shape.js"></script>
+<script src="keys.js"></script>
+<script src="keyui.js"></script>
 <script src="app.js"></script>
 </body>
 </html>

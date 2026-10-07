@@ -26,11 +26,11 @@ service cloud.firestore {
     match /parts/{partNo} {
       allow read: if isMember();
       allow create: if isAdmin()
-        && request.resource.data.keys().hasOnly(['name', 'threshold', 'photoIds', 'points', 'createdAt', 'updatedAt', 'updatedBy'])
+        && request.resource.data.keys().hasOnly(['name', 'threshold', 'photoIds', 'points', 'keySets', 'samples', 'createdAt', 'updatedAt', 'updatedBy'])
         && request.resource.data.name is string && request.resource.data.name.size() <= 100
         && request.resource.data.photoIds is list && request.resource.data.photoIds.size() == 0;
       allow update: if isAdmin()
-        && request.resource.data.keys().hasOnly(['name', 'threshold', 'photoIds', 'points', 'createdAt', 'updatedAt', 'updatedBy'])
+        && request.resource.data.keys().hasOnly(['name', 'threshold', 'photoIds', 'points', 'keySets', 'samples', 'createdAt', 'updatedAt', 'updatedBy'])
         && request.resource.data.name is string && request.resource.data.name.size() <= 100
         && request.resource.data.photoIds is list && request.resource.data.photoIds.size() <= 30
         && (!('threshold' in request.resource.data)
@@ -38,7 +38,13 @@ service cloud.firestore {
                 && request.resource.data.threshold >= 1 && request.resource.data.threshold <= 99))
         // 検査ポイント： { 写真ID: [ポイント…] } の形（写真30枚分まで）
         && (!('points' in request.resource.data)
-            || (request.resource.data.points is map && request.resource.data.points.size() <= 30));
+            || (request.resource.data.points is map && request.resource.data.points.size() <= 30))
+        // 照合キー： { マスター写真ID: [キー…] } の形（写真30枚分まで）
+        && (!('keySets' in request.resource.data)
+            || (request.resource.data.keySets is map && request.resource.data.keySets.size() <= 30))
+        // サンプル写真の区分： { 写真ID: { kind: 'good' か 'bad', type, memo } } の形（写真30枚分まで）
+        && (!('samples' in request.resource.data)
+            || (request.resource.data.samples is map && request.resource.data.samples.size() <= 30));
       allow delete: if isAdmin();
     }
 
