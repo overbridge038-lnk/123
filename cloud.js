@@ -10,9 +10,8 @@
 const PHOTO_MAX_SIDE = 800;          // 写真の長辺(px)
 const PHOTO_QUALITY = 0.8;           // JPEG 品質
 const PHOTO_MAX_BYTES = 400 * 1024;  // 1枚の上限
-const PHOTOS_PER_PART = 30;          // 1品番に登録できる写真（マスター＋サンプル）の上限。1枚 400KB 以下なので最大でも約12MB。セキュリティルールも30枚まで
+const PHOTOS_PER_PART = 10;          // 1品番に登録できる写真の上限（セキュリティルールは30枚まで許可）
 const POINTS_PER_PHOTO = 20;         // 1枚のマスター写真に登録できる検査ポイントの上限
-const KEYS_PER_PART = 30;            // 1品番に登録できる照合キーの上限
 const WRITE_TIMEOUT = 20000;         // 書き込みの待ち時間(ms)
 const PHOTO_WRITE_TIMEOUT = 90000;   // 写真の書き込みは大きいので長めに待つ(ms)
 
@@ -139,8 +138,6 @@ const cloud = {
       };
       if (typeof p.threshold === 'number') rec.threshold = p.threshold;
       if (p.points && typeof p.points === 'object') rec.points = p.points;     // 検査ポイント { 写真ID: [ポイント…] }
-      if (p.keySets && typeof p.keySets === 'object') rec.keySets = p.keySets; // 照合キー { マスター写真ID: [キー…] }
-      if (p.samples && typeof p.samples === 'object') rec.samples = p.samples; // サンプル写真の区分 { 写真ID: { kind: 'good'|'bad', type, memo } }（載っていない写真はマスター）
       const old = localParts.find(lp => lp.partNo === p.partNo);
       if (!old || JSON.stringify(old) !== JSON.stringify(rec)) { await dbPut('cparts', rec); changed = true; }
       if (p.pending) continue;      // 書き込み確定前の写真は、確定してから取りに行く
@@ -226,12 +223,12 @@ const cloud = {
   },
   /** blob: すでに縮小・圧縮済みの JPEG
    *  失敗したときは、どの段階で失敗したか（e.phase）を付けて投げる。写真は1枚ずつ順番に保存する */
-  addPhoto(partNo, blob, w, h, meta) {
-    const run = this._photoQueue.then(() => this._addPhoto(partNo, blob, w, h, meta));
+  addPhoto(partNo, blob, w, h) {
+    const run = this._photoQueue.then(() => this._addPhoto(partNo, blob, w, h));
     this._photoQueue = run.catch(() => {});
     return run;
   },
-  async _addPhoto(partNo, blob, w, h, meta) {   // meta: { kind: 'good'|'bad', type, memo }。省略するとマスター写真
+  async _addPhoto(partNo, blob, w, h) {
     let phase = '準備';
     try {
       this._needAdmin();
@@ -247,9 +244,7 @@ const cloud = {
       phase = 'クラウドへの保存';
       const b = F.writeBatch(this.db);
       b.set(ref, { partNo, jpeg: F.Bytes.fromUint8Array(bytes), w, h, createdAt: now, createdBy: this._by() });
-      const upd = { photoIds: F.arrayUnion(ref.id), updatedAt: now, updatedBy: this._by() };
-      if (meta && (meta.kind === 'good' || meta.kind === 'bad')) upd['samples.' + ref.id] = cleanSample(meta);
-      b.update(pref, upd);
+      b.update(pref, { photoIds: F.arrayUnion(ref.id), updatedAt: now, updatedBy: this._by() });
       await this._timeout(b.commit(), PHOTO_WRITE_TIMEOUT);
       phase = '端末内への保存';
       try { await dbPut('cmasters', { id: ref.id, partNo, blob, createdAt: now }); this.onData(); }
@@ -265,9 +260,7 @@ const cloud = {
     const F = window.FB, b = F.writeBatch(this.db);
     b.delete(F.doc(this.db, 'photos', id));
     const upd = { photoIds: F.arrayRemove(id), updatedAt: Date.now(), updatedBy: this._by() };
-    upd['points.' + id] = F.deleteField();            // その写真の検査ポイント・照合キー・サンプルの区分も一緒に消す
-    upd['keySets.' + id] = F.deleteField();
-    upd['samples.' + id] = F.deleteField();
+    upd['points.' + id] = F.deleteField();            // その写真の検査ポイントも一緒に消す
     b.update(F.doc(this.db, 'parts', partNo), upd);
     await this._timeout(b.commit());
     await dbDel('cmasters', id); this.onData();
@@ -286,47 +279,8 @@ const cloud = {
       if (list.length) cur.points[photoId] = list; else delete cur.points[photoId];
       await dbPut('cparts', cur); this.onData();
     }
-  },
-  /** 1枚のマスター写真の照合キーを保存する。list が空なら削除。1品番の合計は KEYS_PER_PART 個まで
-   *  list: [{ id, name, type, x, y, w, h, must, th?, exp? }]（x,y,w,h は 0〜1 の比率） */
-  async setKeys(partNo, photoId, list) {
-    this._needAdmin();
-    const cur = await dbGet('cparts', partNo);
-    const others = Object.entries((cur && cur.keySets) || {}).filter(([id]) => id !== photoId).reduce((a, [, v]) => a + (Array.isArray(v) ? v.length : 0), 0);
-    if (list.length + others > KEYS_PER_PART) throw new Error(`照合キーは1つの品番に${KEYS_PER_PART}個までです`);
-    const F = window.FB, upd = { updatedAt: Date.now(), updatedBy: this._by() };
-    upd['keySets.' + photoId] = list.length ? list : F.deleteField();
-    await this._timeout(F.updateDoc(F.doc(this.db, 'parts', partNo), upd));
-    if (cur) {
-      cur.keySets = Object.assign({}, cur.keySets);
-      if (list.length) cur.keySets[photoId] = list; else delete cur.keySets[photoId];
-      await dbPut('cparts', cur); this.onData();
-    }
-  },
-  /** 写真の区分を変える。meta = { kind: 'good'|'bad', type, memo }。null にすると「マスター写真」に戻す */
-  async setSample(partNo, photoId, meta) {
-    this._needAdmin();
-    const F = window.FB, upd = { updatedAt: Date.now(), updatedBy: this._by() };
-    const clean = meta && (meta.kind === 'good' || meta.kind === 'bad') ? cleanSample(meta) : null;
-    upd['samples.' + photoId] = clean || F.deleteField();
-    await this._timeout(F.updateDoc(F.doc(this.db, 'parts', partNo), upd));
-    const cur = await dbGet('cparts', partNo);
-    if (cur) {
-      cur.samples = Object.assign({}, cur.samples);
-      if (clean) cur.samples[photoId] = clean; else delete cur.samples[photoId];
-      await dbPut('cparts', cur); this.onData();
-    }
   }
 };
-
-/** サンプル写真の区分を、保存できる形に整える */
-function cleanSample(m) {
-  const o = { kind: m.kind === 'bad' ? 'bad' : 'good' };
-  if (o.kind === 'bad') o.type = ['欠品', '付け間違い', '別品番', 'その他'].includes(m.type) ? m.type : 'その他';
-  const memo = String(m.memo || '').slice(0, 100);
-  if (memo) o.memo = memo;
-  return o;
-}
 
 function hhmm(ts) {
   const d = new Date(ts), p = x => String(x).padStart(2, '0');
